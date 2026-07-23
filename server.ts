@@ -4,6 +4,9 @@ import { createServer as createViteServer } from "vite";
 import { GoogleGenAI, Type } from "@google/genai";
 import dotenv from "dotenv";
 import fs from "fs";
+import { createStorage } from "./server/storage";
+import { requireUser } from "./server/auth";
+import { createDataRouter } from "./server/dataRoutes";
 
 // Initialize a log file to capture production/runtime output
 const logFile = path.join(process.cwd(), "server.log");
@@ -32,10 +35,16 @@ console.warn = (...args: any[]) => {
 
 dotenv.config();
 
-const PORT = 3000;
+// Replit deployments provide PORT; default to 3000 for local dev.
+const PORT = Number(process.env.PORT) || 3000;
 const app = express();
 
-app.use(express.json());
+// 2mb: the one-time task migration uploads the full task list in one request
+app.use(express.json({ limit: "2mb" }));
+
+// Persistent data API (PostgreSQL via DATABASE_URL, JSON-file fallback in dev)
+const storage = createStorage();
+app.use("/api/data", requireUser, createDataRouter(storage));
 
 // Lazy-initialize Gemini client
 let aiClient: GoogleGenAI | null = null;
@@ -102,8 +111,8 @@ function resolveDateContext(currentDate?: string) {
   return { iso, dayName, tomorrowIso };
 }
 
-// 1. API: Organize Brain Dump
-app.post("/api/organize-dump", async (req, res) => {
+// 1. API: Organize Brain Dump (auth required: burns Gemini quota)
+app.post("/api/organize-dump", requireUser, async (req, res) => {
   const { dumpText, currentDate, northStar } = req.body || {};
   try {
     if (!dumpText || !dumpText.trim()) {
@@ -205,8 +214,8 @@ Please parse every single distinct line, item, or thought from the above text in
   }
 });
 
-// 2. API: Daily Focus Coach Review
-app.post("/api/coach-today", async (req, res) => {
+// 2. API: Daily Focus Coach Review (auth required: burns Gemini quota)
+app.post("/api/coach-today", requireUser, async (req, res) => {
   try {
     const { tasks, northStar } = req.body;
     if (!tasks || !Array.isArray(tasks)) {
@@ -666,7 +675,7 @@ Please write my daily morning focus coaching summary.`;
       `).join("")
       : `<div style="padding: 16px 0; text-align: center; color: #9ca3af; font-size: 13px;">Inbox clear of urgent renewals, billing alerts, or critical tasks.</div>`;
 
-    const currentDashboardUrl = dashboardUrl || "https://ai.studio/build";
+    const currentDashboardUrl = dashboardUrl || process.env.APP_URL || (req.headers.origin as string) || "#";
 
     const htmlContent = `
 <!DOCTYPE html>
@@ -783,9 +792,13 @@ Please write my daily morning focus coaching summary.`;
 
 // Setup Vite or production serving
 async function startServer() {
+  await storage.init();
+
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({
-      server: { middlewareMode: true },
+      // allowedHosts: Vite 6 rejects unknown Host headers, which blocks the
+      // Replit *.replit.dev workspace preview without this.
+      server: { middlewareMode: true, allowedHosts: true },
       appType: "spa",
     });
     app.use(vite.middlewares);

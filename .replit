@@ -1,0 +1,12 @@
+modules = ["nodejs-20"]
+run = "npm run dev"
+hidden = [".config", "node_modules", "dist", ".data"]
+
+[deployment]
+deploymentTarget = "autoscale"
+build = ["npm", "run", "build"]
+run = ["npm", "run", "start"]
+
+[[ports]]
+localPort = 3000
+externalPort = 80

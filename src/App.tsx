@@ -277,7 +277,7 @@ export default function App() {
       safeLocalStorage.removeItem("brain_dump_north_star");
       
       if (dbStatus === "synced" || dbStatus === "connecting") {
-        const { clearAllDataFromDb } = await import("./lib/firebase");
+        const { clearAllDataFromDb } = await import("./lib/api");
         await clearAllDataFromDb();
       }
       setShowResetConfirm(false);
@@ -289,7 +289,7 @@ export default function App() {
   const handleReSyncAllData = async () => {
     setIsReSyncing(true);
     try {
-      const { flushPendingWrites } = await import("./lib/firebase");
+      const { flushPendingWrites } = await import("./lib/api");
       // Live snapshots keep state current; this just confirms every queued
       // local write has reached the server (or reports that we're offline).
       const flushed = await Promise.race([
@@ -316,18 +316,18 @@ export default function App() {
   useEffect(() => {
     if (dbStatus === "connecting") {
       const timer = setTimeout(() => {
-        console.warn("Firestore connection check timed out. Defaulting connection indicator to offline/local.");
+        console.warn("Server sync check timed out. Defaulting connection indicator to offline/local.");
         setDbStatus("offline");
       }, 5000);
       return () => clearTimeout(timer);
     }
   }, [dbStatus]);
 
-  // One-time guards for migrating pre-Firestore local data up to the cloud.
-  // "has_synced_with_firestore" marks that this device's localStorage is just a
-  // mirror of Firestore — after that, local-only tasks are never re-uploaded
+  // One-time guards for migrating pre-server local data up to the cloud.
+  // "has_synced_with_pg" marks that this device's localStorage is just a
+  // mirror of the server DB — after that, local-only tasks are never re-uploaded
   // (re-uploading them is how deleted tasks used to resurrect across devices).
-  const hasEverSyncedRef = useRef(safeLocalStorage.getItem("has_synced_with_firestore") === "true");
+  const hasEverSyncedRef = useRef(safeLocalStorage.getItem("has_synced_with_pg") === "true");
   const localTasksMigratedRef = useRef(false);
   const localFiltersMigratedRef = useRef(false);
 
@@ -337,16 +337,16 @@ export default function App() {
     let unsubscribeEmailFilters: (() => void) | null = null;
     let unsubscribeBriefing: (() => void) | null = null;
 
-    async function initFirebase() {
+    async function initDataSync() {
       try {
-        const { seedInitialTasksIfEmpty, subscribeTasks, subscribeNorthStar, subscribeEmailFilters, subscribeBriefingSettings } = await import("./lib/firebase");
+        const { seedInitialTasksIfEmpty, subscribeTasks, subscribeNorthStar, subscribeEmailFilters, subscribeBriefingSettings } = await import("./lib/api");
 
-        // Seed initial tasks if empty on firestore in background (non-blocking)
+        // Seed initial data in background (non-blocking; no-op with empty defaults)
         seedInitialTasksIfEmpty(INITIAL_TASKS, INITIAL_NORTH_STAR).catch((err) => {
-          console.error("Firebase subscription seeding error:", err);
+          console.error("Data seeding error:", err);
         });
 
-        // Subscribe to remote tasks. Firestore (with its offline persistence)
+        // Subscribe to remote tasks. The server (polled by src/lib/api)
         // is the source of truth: snapshots REPLACE local state. The old
         // union-merge re-uploaded anything left in another device's
         // localStorage, which resurrected deleted tasks. The only exception is
@@ -358,18 +358,18 @@ export default function App() {
               !hasEverSyncedRef.current && remoteTasks.length === 0 && localTasks.length > 0;
 
             if (isLegacyLocalOnlyData) {
-              // This device has pre-Firestore tasks and the remote DB is empty:
-              // keep the local list and (once the server confirms the DB really
-              // is empty) migrate it up. Never wipe it with an empty snapshot.
+              // This device has tasks from before the server DB existed and
+              // the remote DB is empty: keep the local list and migrate it up
+              // in one bulk call (the server's onlyIfEmpty guard makes this
+              // race-safe if two devices migrate at once). Never wipe local
+              // data with an empty snapshot.
               if (!fromCache && !localTasksMigratedRef.current) {
                 localTasksMigratedRef.current = true;
-                import("./lib/firebase").then(({ saveTaskToDb }) => {
-                  localTasks.forEach((t) =>
-                    saveTaskToDb(t).catch((e) => {
-                      console.error("Error migrating local task to Firestore:", e);
-                      setDbStatus("error");
-                    })
-                  );
+                import("./lib/api").then(({ bulkUploadTasks }) => {
+                  bulkUploadTasks(localTasks).catch((e) => {
+                    console.error("Error migrating local tasks to the server:", e);
+                    setDbStatus("error");
+                  });
                 });
               }
             } else {
@@ -378,12 +378,12 @@ export default function App() {
 
             if (!fromCache) {
               hasEverSyncedRef.current = true;
-              safeLocalStorage.setItem("has_synced_with_firestore", "true");
+              safeLocalStorage.setItem("has_synced_with_pg", "true");
               setDbStatus("synced");
             }
           },
           (err) => {
-            console.error("Firebase subscription tasks error:", err);
+            console.error("Tasks sync error:", err);
             setDbStatus("offline");
           }
         );
@@ -396,7 +396,7 @@ export default function App() {
             }
           },
           (err) => {
-            console.error("Firebase subscription North Star error:", err);
+            console.error("North Star sync error:", err);
           }
         );
 
@@ -414,16 +414,16 @@ export default function App() {
                 localFiltersMigratedRef.current = true;
                 const local = emailFiltersRef.current;
                 if (local.ignoredSenders.length || local.ignoredDomains.length || local.ignoredEmails.length) {
-                  import("./lib/firebase").then(({ saveEmailFiltersToDb }) => {
+                  import("./lib/api").then(({ saveEmailFiltersToDb }) => {
                     saveEmailFiltersToDb(local).catch((err) => {
-                      console.error("Failed to migrate local email filters to Firestore:", err);
+                      console.error("Failed to migrate local email filters to the server:", err);
                     });
                   });
                 }
               }
             },
             (err) => {
-              console.error("Firebase subscription Email Filters error:", err);
+              console.error("Email Filters sync error:", err);
             }
           );
         }
@@ -445,17 +445,17 @@ export default function App() {
               }
             },
             (err) => {
-              console.error("Firebase subscription Briefing settings error:", err);
+              console.error("Briefing settings sync error:", err);
             }
           );
         }
       } catch (err) {
-        console.error("Failed to load Firebase, falling back to local state.", err);
+        console.error("Failed to start data sync, falling back to local state.", err);
         setDbStatus("offline");
       }
     }
 
-    initFirebase();
+    initDataSync();
 
     return () => {
       if (unsubscribeTasks) unsubscribeTasks();
@@ -467,116 +467,60 @@ export default function App() {
 
   // --- Google Authentication and Triage Integration ---
   useEffect(() => {
-    let unsubscribeAuth: (() => void) | null = null;
-    
+    let unsubscribeAuthExpired: (() => void) | null = null;
+
     async function setupAuth() {
-      // 1. Try Direct Google Identity Services (GIS) first if stored in session.
-      // readStoredGoogleToken discards tokens past their ~1h lifetime, so an
-      // expired session falls through to a fresh sign-in instead of restoring
-      // a token every Gmail call would reject.
-      let storedGisToken: string | null = null;
       try {
-        const { readStoredGoogleToken } = await import("./lib/firebase");
-        storedGisToken = readStoredGoogleToken("gis_access_token");
-      } catch (e) {
-        console.error("Failed to load token helper:", e);
-      }
-      const storedGisUser = safeSessionStorage.getItem("gis_user");
-      if (!storedGisToken && storedGisUser) {
-        safeSessionStorage.removeItem("gis_user");
-      }
-      if (storedGisToken && storedGisUser) {
-        try {
-          const parsedUser = JSON.parse(storedGisUser);
-          setGoogleUser(parsedUser);
-          setAccessToken(storedGisToken);
-          setNeedsAuth(false);
+        const { readStoredGoogleToken, onAuthExpired } = await import("./lib/api");
+
+        // Any 401 from the data API or an aged-out token sends the user back
+        // to a clean sign-in screen instead of failing silently.
+        unsubscribeAuthExpired = onAuthExpired(() => {
+          setGoogleUser(null);
+          setAccessToken(null);
+          setNeedsAuth(true);
           setIsAuthChecking(false);
-          if (typeof fetchTriagedEmails === "function") {
-            fetchTriagedEmails(storedGisToken);
-          }
+        });
 
-          // Link Firebase Auth in background to authenticate Firestore
-          import("./lib/firebase")
-            .then(({ signInWithGoogleToken }) => {
-              signInWithGoogleToken(storedGisToken).catch((err) => {
-                console.warn("Failed to background sign-in Firebase Auth with GIS token on restore:", err);
-              });
-            })
-            .catch((err) => {
-              console.error("Failed to load Firebase auth helper for background sign-in on restore:", err);
-            });
-
-          return;
-        } catch (e) {
-          console.error("Failed to restore stored GIS user:", e);
+        // Restore the GIS session if a still-valid token is stored.
+        // readStoredGoogleToken discards tokens past their ~1h lifetime, so an
+        // expired session falls through to a fresh sign-in instead of
+        // restoring a token every API call would reject.
+        const storedGisToken = readStoredGoogleToken("gis_access_token");
+        const storedGisUser = safeSessionStorage.getItem("gis_user");
+        if (!storedGisToken && storedGisUser) {
+          safeSessionStorage.removeItem("gis_user");
         }
-      }
-
-      try {
-        const { initAuth, checkRedirectResult } = await import("./lib/firebase");
-        
-        // Check if there is a redirect result first
-        try {
-          const redirectData = await checkRedirectResult();
-          if (redirectData) {
-            setGoogleUser(redirectData.user);
-            setAccessToken(redirectData.accessToken);
+        if (storedGisToken && storedGisUser) {
+          try {
+            const parsedUser = JSON.parse(storedGisUser);
+            setGoogleUser(parsedUser);
+            setAccessToken(storedGisToken);
             setNeedsAuth(false);
             setIsAuthChecking(false);
             if (typeof fetchTriagedEmails === "function") {
-              fetchTriagedEmails(redirectData.accessToken);
+              fetchTriagedEmails(storedGisToken);
             }
-          }
-        } catch (redirectErr: any) {
-          console.error("Redirect sign-in check failed:", redirectErr);
-          setLoginErrorDetails({
-            message: redirectErr?.message,
-            code: redirectErr?.code,
-            customData: redirectErr?.customData,
-            name: redirectErr?.name,
-            stack: redirectErr?.stack,
-          });
-          const errMsg = redirectErr?.message || String(redirectErr);
-          if (
-            redirectErr?.code === "auth/unauthorized-domain" ||
-            errMsg.toLowerCase().includes("unauthorized-domain") ||
-            errMsg.toLowerCase().includes("unauthorized_domain") ||
-            errMsg.toLowerCase().includes("unauthorized domain")
-          ) {
-            setLoginError("unauthorized-domain");
-          } else {
-            setLoginError(errMsg);
+            return;
+          } catch (e) {
+            console.error("Failed to restore stored GIS user:", e);
           }
         }
 
-        unsubscribeAuth = initAuth(
-          (user, token) => {
-            setGoogleUser(user);
-            setAccessToken(token);
-            setNeedsAuth(false);
-            setIsAuthChecking(false);
-          },
-          () => {
-            // Only set to false/null if there's no GIS token already active
-            if (!safeSessionStorage.getItem("gis_access_token")) {
-              setGoogleUser(null);
-              setAccessToken(null);
-              setNeedsAuth(true);
-            }
-            setIsAuthChecking(false);
-          }
-        );
+        setGoogleUser(null);
+        setAccessToken(null);
+        setNeedsAuth(true);
+        setIsAuthChecking(false);
       } catch (err) {
-        console.error("Failed to initialize Auth listener:", err);
+        console.error("Failed to initialize auth:", err);
         setIsAuthChecking(false);
       }
     }
-    
+
     setupAuth();
-    
+
     return () => {
-      if (unsubscribeAuth) unsubscribeAuth();
+      if (unsubscribeAuthExpired) unsubscribeAuthExpired();
     };
   }, []);
 
@@ -633,16 +577,13 @@ export default function App() {
             // Fetch triaged emails
             fetchTriagedEmails(token);
 
-            // Store the token with its expiry and link Firebase Auth in background
-            import("./lib/firebase")
-              .then(({ storeGoogleToken, signInWithGoogleToken }) => {
+            // Store the token with its expiry (also kicks off the data poll)
+            import("./lib/api")
+              .then(({ storeGoogleToken }) => {
                 storeGoogleToken("gis_access_token", token);
-                signInWithGoogleToken(token).catch((err) => {
-                  console.warn("Failed to background sign-in Firebase Auth with GIS token:", err);
-                });
               })
               .catch((err) => {
-                console.error("Failed to load Firebase auth helper for background sign-in:", err);
+                console.error("Failed to store Google token:", err);
               });
           } catch (profileErr: any) {
             console.error("Failed to fetch user profile:", profileErr);
@@ -658,74 +599,9 @@ export default function App() {
     }
   };
 
-  const handleLogin = async () => {
-    setLoginError(null);
-    setLoginErrorDetails(null);
-    try {
-      const { googleSignIn } = await import("./lib/firebase");
-      const result = await googleSignIn();
-      if (result) {
-        setGoogleUser(result.user);
-        setAccessToken(result.accessToken);
-        setNeedsAuth(false);
-        // Automatically load emails after successful sign in
-        fetchTriagedEmails(result.accessToken);
-      }
-    } catch (err: any) {
-      console.error("Login failed:", err);
-      setLoginErrorDetails({
-        message: err?.message,
-        code: err?.code,
-        customData: err?.customData,
-        name: err?.name,
-        stack: err?.stack,
-      });
-      const errMsg = err?.message || String(err);
-      if (
-        err?.code === "auth/unauthorized-domain" ||
-        errMsg.toLowerCase().includes("unauthorized-domain") ||
-        errMsg.toLowerCase().includes("unauthorized_domain") ||
-        errMsg.toLowerCase().includes("unauthorized domain")
-      ) {
-        setLoginError("unauthorized-domain");
-      } else {
-        setLoginError(err?.code ? `${err.code}: ${errMsg}` : errMsg);
-      }
-    }
-  };
-
-  const handleRedirectLogin = async () => {
-    setLoginError(null);
-    setLoginErrorDetails(null);
-    try {
-      const { googleSignInRedirect } = await import("./lib/firebase");
-      await googleSignInRedirect();
-    } catch (err: any) {
-      console.error("Redirect login failed:", err);
-      setLoginErrorDetails({
-        message: err?.message,
-        code: err?.code,
-        customData: err?.customData,
-        name: err?.name,
-        stack: err?.stack,
-      });
-      const errMsg = err?.message || String(err);
-      if (
-        err?.code === "auth/unauthorized-domain" ||
-        errMsg.toLowerCase().includes("unauthorized-domain") ||
-        errMsg.toLowerCase().includes("unauthorized_domain") ||
-        errMsg.toLowerCase().includes("unauthorized domain")
-      ) {
-        setLoginError("unauthorized-domain");
-      } else {
-        setLoginError(err?.code ? `${err.code}: ${errMsg}` : errMsg);
-      }
-    }
-  };
-
   const handleLogout = async () => {
     try {
-      const { logout } = await import("./lib/firebase");
+      const { logout } = await import("./lib/api");
       await logout();
       setGoogleUser(null);
       setAccessToken(null);
@@ -823,7 +699,7 @@ export default function App() {
       setLastSentDailySummaryDate(sentDateStr);
       safeLocalStorage.setItem("last_sent_daily_summary_date", sentDateStr);
       // Share the sent date so other devices don't auto-send a duplicate today
-      import("./lib/firebase")
+      import("./lib/api")
         .then(({ saveBriefingSettingsToDb }) => saveBriefingSettingsToDb({ lastSentDate: sentDateStr }))
         .catch((e) => console.error("Failed to sync briefing sent date:", e));
     } catch (err: any) {
@@ -874,7 +750,7 @@ export default function App() {
         body: JSON.stringify({
           currentDate: new Date().toLocaleDateString("en-CA"), // Dynamically calculate current local date (YYYY-MM-DD)
           // Read via ref: this function is often invoked from mount-time
-          // closures whose captured state predates the Firestore filter sync
+          // closures whose captured state predates the server filter sync
           ...emailFiltersRef.current
         })
       });
@@ -937,7 +813,7 @@ export default function App() {
   };
 
   // All ignore/mute mutations use functional state updates (never stale
-  // closures) and atomic arrayUnion/arrayRemove writes in Firestore, so
+  // closures) and atomic add/remove writes on the server, so
   // concurrent actions across tabs/devices can never clobber each other.
   // The visible triage list is derived via visibleTriagedEmails, so entries
   // disappear instantly and stay hidden on every synced device.
@@ -946,7 +822,7 @@ export default function App() {
     setIgnoredEmails((prev) => (prev.includes(emailId) ? prev : [...prev, emailId]));
 
     try {
-      const { addEmailFilterEntries } = await import("./lib/firebase");
+      const { addEmailFilterEntries } = await import("./lib/api");
       await addEmailFilterEntries({ emails: [emailId] });
     } catch (err) {
       console.error("Failed to save email filters to remote DB:", err);
@@ -957,7 +833,7 @@ export default function App() {
     setIgnoredEmails((prev) => prev.filter((id) => id !== emailId));
 
     try {
-      const { removeEmailFilterEntries } = await import("./lib/firebase");
+      const { removeEmailFilterEntries } = await import("./lib/api");
       await removeEmailFilterEntries({ emails: [emailId] });
     } catch (err) {
       console.error("Failed to save email filters to remote DB:", err);
@@ -969,7 +845,7 @@ export default function App() {
     const domain = extractEmailDomain(emailAddress);
 
     try {
-      const { addEmailFilterEntries } = await import("./lib/firebase");
+      const { addEmailFilterEntries } = await import("./lib/api");
       if (ignoreType === "sender" && emailAddress) {
         setIgnoredSenders((prev) => (prev.includes(emailAddress) ? prev : [...prev, emailAddress]));
         await addEmailFilterEntries({ senders: [emailAddress] });
@@ -984,7 +860,7 @@ export default function App() {
 
   const handleRemoveIgnoreRule = async (value: string, ignoreType: "sender" | "domain") => {
     try {
-      const { removeEmailFilterEntries } = await import("./lib/firebase");
+      const { removeEmailFilterEntries } = await import("./lib/api");
       if (ignoreType === "sender") {
         setIgnoredSenders((prev) => prev.filter((s) => s !== value));
         await removeEmailFilterEntries({ senders: [value] });
@@ -1016,7 +892,7 @@ export default function App() {
     setConvertedEmailIds((prev) => [...prev, email.emailId]);
 
     try {
-      const { saveTaskToDb } = await import("./lib/firebase");
+      const { saveTaskToDb } = await import("./lib/api");
       await saveTaskToDb(newTask);
     } catch (err) {
       console.error("Failed to save converted task to remote DB:", err);
@@ -1140,15 +1016,15 @@ export default function App() {
       }
     });
 
-    import("./lib/firebase")
+    import("./lib/api")
       .then(({ saveTaskToDb }) => {
         saveTaskToDb(task).catch((e) => {
-          console.error("Error saving task to Firestore in background:", e);
+          console.error("Error saving task in background:", e);
           setDbStatus("error");
         });
       })
       .catch((e) => {
-        console.error("Failed to load Firebase save helper:", e);
+        console.error("Failed to load save helper:", e);
       });
   };
 
@@ -1258,29 +1134,29 @@ export default function App() {
   const deleteTask = async (taskId: string) => {
     setTasks((prev) => prev.filter((t) => t.id !== taskId));
 
-    import("./lib/firebase")
+    import("./lib/api")
       .then(({ deleteTaskFromDb }) => {
         deleteTaskFromDb(taskId).catch((e) => {
-          console.error("Error deleting task from Firestore in background:", e);
+          console.error("Error deleting task in background:", e);
           setDbStatus("error");
         });
       })
       .catch((e) => {
-        console.error("Failed to load Firebase delete helper:", e);
+        console.error("Failed to load delete helper:", e);
       });
   };
 
   const saveNorthStar = async (ns: NorthStar) => {
     setNorthStar(ns);
 
-    import("./lib/firebase")
+    import("./lib/api")
       .then(({ saveNorthStarToDb }) => {
         saveNorthStarToDb(ns).catch((e) => {
-          console.error("Error saving North Star to Firestore in background:", e);
+          console.error("Error saving North Star in background:", e);
         });
       })
       .catch((e) => {
-        console.error("Failed to load Firebase save North Star helper:", e);
+        console.error("Failed to load North Star save helper:", e);
       });
   };
 
@@ -1461,7 +1337,10 @@ export default function App() {
       try {
         const response = await fetch("/api/organize-dump", {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: {
+            "Content-Type": "application/json",
+            ...(accessToken ? { Authorization: `Bearer ${accessToken}` } : {})
+          },
           body: JSON.stringify({
             dumpText: textToAnalyze,
             currentDate: todayStr,
@@ -1568,7 +1447,10 @@ export default function App() {
     try {
       const response = await fetch("/api/coach-today", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          ...(accessToken ? { Authorization: `Bearer ${accessToken}` } : {})
+        },
         body: JSON.stringify({
           tasks: todayTasks,
           northStar: `${northStar.title}: ${northStar.description}`
@@ -1931,7 +1813,7 @@ export default function App() {
   // Triage results actually shown: always re-filtered against the CURRENT
   // ignore lists. The server also pre-filters, but this guarantees that an
   // ignore action (from this or any synced device) takes effect immediately,
-  // even for results fetched before the Firestore filters arrived.
+  // even for results fetched before the synced filters arrived.
   const visibleTriagedEmails = useMemo(() => {
     return triagedEmails.filter((email: any) => {
       const id = email.emailId || email.id;
@@ -1996,9 +1878,8 @@ export default function App() {
               </div>
 
               <div className="space-y-4">
-                {/* Primary Recommended Sign-In Button (Firebase Popup - Works on all deployed domains) */}
                 <button
-                  onClick={handleLogin}
+                  onClick={handleGISLogin}
                   className="w-full bg-amber-500 hover:bg-amber-400 text-neutral-950 font-bold py-3.5 px-6 rounded-xl transition-all shadow-lg flex items-center justify-center gap-3 cursor-pointer group hover:scale-[1.01]"
                 >
                   <svg className="w-5 h-5" viewBox="0 0 24 24">
@@ -2008,39 +1889,10 @@ export default function App() {
                     />
                   </svg>
                   <div className="text-left leading-tight">
-                    <span className="text-sm font-semibold block">Sign in with Google (Firebase Popup)</span>
-                    <span className="text-[10px] font-mono opacity-80 font-normal">Recommended for Deployed & Shared Apps</span>
+                    <span className="text-sm font-semibold block">Sign in with Google</span>
+                    <span className="text-[10px] font-mono opacity-80 font-normal">Grants Gmail triage & briefing permissions</span>
                   </div>
                 </button>
-
-                <div className="flex items-center gap-2 my-2">
-                  <div className="h-px bg-neutral-800 flex-1" />
-                  <span className="text-[9px] font-mono text-neutral-500 uppercase tracking-widest shrink-0">or alternative login options</span>
-                  <div className="h-px bg-neutral-800 flex-1" />
-                </div>
-
-                <div className="grid grid-cols-2 gap-2.5">
-                  <button
-                    onClick={handleGISLogin}
-                    className="bg-neutral-800 hover:bg-neutral-750 border border-neutral-700 text-white font-medium py-2.5 px-3 rounded-xl transition-all shadow-sm flex items-center justify-center gap-2 cursor-pointer group hover:scale-[1.01] text-[11px]"
-                  >
-                    <svg className="w-3.5 h-3.5" viewBox="0 0 24 24">
-                      <path
-                        fill="#ffffff"
-                        d="M12.24 10.285V14.4h6.887c-.648 2.41-2.519 4.2-5.136 4.2A5.76 5.76 0 0 1 8.24 12.8a5.76 5.76 0 0 1 5.751-5.8c1.556 0 2.956.6 4.024 1.57l3.056-3.055A9.95 9.95 0 0 0 14 2 10 10 0 0 0 4 12a10 10 0 0 0 10 10c5.3 0 9.85-3.834 9.85-10 0-.6-.08-1.215-.224-1.715H12.24z"
-                      />
-                    </svg>
-                    <span>Direct GIS Mode</span>
-                  </button>
-
-                  <button
-                    onClick={handleRedirectLogin}
-                    className="bg-neutral-800 hover:bg-neutral-750 border border-neutral-700 text-white font-medium py-2.5 px-3 rounded-xl transition-all flex items-center justify-center gap-2 cursor-pointer group hover:scale-[1.01] text-[11px] font-mono tracking-wider uppercase"
-                  >
-                    <RefreshCw className="w-3 h-3 text-amber-500 group-hover:rotate-180 transition-transform duration-500" />
-                    <span>Firebase Redirect</span>
-                  </button>
-                </div>
 
                 {/* Helper Card explaining Current Domain / Direct Mode origin setup */}
                 <div className="p-3 bg-neutral-950/60 rounded-xl border border-neutral-800 text-left space-y-2 text-[11px]">
@@ -2080,23 +1932,20 @@ export default function App() {
                       <h4 className="text-xs font-bold font-mono uppercase tracking-wider text-red-300">Authentication Alert</h4>
                       <p className="text-xs text-neutral-300 mt-1 leading-relaxed">
                         {loginError === "unauthorized-domain"
-                          ? "This domain is not yet authorized in your Firebase Project settings."
+                          ? "This app origin is not yet authorized for Google sign-in. Copy the origin below and add it to Authorized JavaScript origins in Google Cloud Console."
                           : `Error: ${loginError}`}
                       </p>
                     </div>
                   </div>
 
                   <div className="p-3 bg-neutral-950/40 rounded-lg border border-neutral-800 space-y-2 text-[11px] leading-relaxed text-neutral-400">
-                    <p className="font-semibold text-neutral-300">💡 Dynamic Workarounds:</p>
+                    <p className="font-semibold text-neutral-300">💡 Troubleshooting:</p>
                     <ul className="list-disc pl-4 space-y-1">
                       <li>
-                        <span className="text-amber-400 font-semibold">Option A (Recommended)</span>: Use the primary <strong className="text-neutral-200">"Sign in with Google (Firebase Popup)"</strong> button above.
+                        <span className="text-amber-400 font-semibold">Error 400: origin_mismatch</span>: copy the origin above and add it to <strong className="text-neutral-200">Authorized JavaScript origins</strong> in Google Cloud Console Credentials, then retry.
                       </li>
                       <li>
-                        <span className="text-amber-400 font-semibold">Option B</span>: Use <strong className="text-neutral-200">"Firebase Redirect"</strong> to bypass popup blocker / mobile browser security restrictions.
-                      </li>
-                      <li>
-                        <span className="text-amber-400 font-semibold">Option C</span>: To authorize this origin for Direct Mode or Firebase, copy the origin above and add it to your GCP credentials or Firebase Authorized Domains.
+                        <span className="text-amber-400 font-semibold">Popup blocked</span>: allow popups for this site (the Google sign-in opens in a popup), or open the app in its own browser tab instead of an embedded preview.
                       </li>
                     </ul>
 
@@ -2525,7 +2374,7 @@ export default function App() {
                       </div>
 
                       <button
-                        onClick={handleLogin}
+                        onClick={handleGISLogin}
                         className="px-6 py-3 bg-neutral-900 hover:bg-neutral-800 text-white rounded-xl text-xs font-bold uppercase tracking-wider transition-all flex items-center gap-2.5 shadow-md cursor-pointer"
                       >
                         <svg className="w-4 h-4" viewBox="0 0 24 24">
@@ -2886,7 +2735,7 @@ export default function App() {
                                     const val = e.target.checked;
                                     setAutoSendDailySummary(val);
                                     safeLocalStorage.setItem("auto_send_daily_summary", val ? "true" : "false");
-                                    import("./lib/firebase")
+                                    import("./lib/api")
                                       .then(({ saveBriefingSettingsToDb }) => saveBriefingSettingsToDb({ autoSend: val }))
                                       .catch((err) => console.error("Failed to sync briefing settings:", err));
                                   }}

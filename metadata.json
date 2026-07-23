@@ -1,6 +1,0 @@
-{
-  "name": "Action Man",
-  "description": "An intelligent high-velocity brain dump planner that automatically surfaces drop-dead deadlines, extracts client tags like Rain Ventures or Human Connection Co, and drives a distraction-free Focus Mode.",
-  "requestFramePermissions": [],
-  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
-}

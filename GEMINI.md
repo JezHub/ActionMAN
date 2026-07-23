@@ -1,5 +1,9 @@
 # Action Man — Instructions for AI Assistants (Gemini / AI Studio)
 
+> **SUPERSEDED:** the app now lives on Replit — `replit.md` is the current
+> authority (same rules, updated architecture). This file is kept for
+> history; if the two ever disagree, `replit.md` wins.
+
 Read this before changing ANY code in this repository. Previous sessions have
 rewritten working files wholesale and re-introduced bugs that were already
 fixed. The rules below exist because each one guards against a real production
