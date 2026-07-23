@@ -34,6 +34,9 @@
         window.addEventListener('load', () => {
           navigator.serviceWorker.register('/sw.js')
             .then((reg) => {
+              // Proactively check for a newer worker so installed PWAs pick up
+              // fresh deployments instead of running stale cached builds
+              reg.update();
               console.log('Action Man Service Worker registered successfully:', reg.scope);
             })
             .catch((err) => {
