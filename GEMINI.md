@@ -5,6 +5,18 @@ rewritten working files wholesale and re-introduced bugs that were already
 fixed. The rules below exist because each one guards against a real production
 bug that has already bitten the owner.
 
+> ⚠️ **THIS HAS ALREADY HAPPENED ONCE.** A previous session ran an unprompted
+> "refactor: remove unused code and simplify dependencies" pass (commit
+> `59d14ba`) that deleted this file, reverted every fix listed below, and
+> added a mount-time "merge local + remote and write everything back" sync
+> that resurrected deleted tasks. It all had to be reverted.
+>
+> Therefore: **NEVER run a cleanup, refactor, simplification, or
+> "remove unused code" pass on this repository — not even as a side effect
+> of another task.** Code that looks unused or redundant here is load-bearing
+> (see Invariants). Only change what the owner's request explicitly requires,
+> and never delete this file.
+
 ## Prime directives
 
 1. **Never regenerate a file from scratch.** Make the smallest targeted edit
