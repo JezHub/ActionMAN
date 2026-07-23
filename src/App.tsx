@@ -1347,6 +1347,27 @@ export default function App() {
   const todayStr = new Date().toISOString().split("T")[0] || "2026-07-23";
   const todayDateObj = new Date(todayStr);
 
+  const getValidDateString = (dateStr?: string): string => {
+    if (!dateStr || typeof dateStr !== "string") return "";
+    const clean = dateStr.split("T")[0].trim();
+    if (clean === "null" || clean === "undefined" || clean === "tags" || clean === "due date") return "";
+    const parts = clean.split("-").map(Number);
+    if (
+      parts.length === 3 &&
+      !isNaN(parts[0]) &&
+      !isNaN(parts[1]) &&
+      !isNaN(parts[2]) &&
+      parts[0] > 1900 &&
+      parts[1] >= 1 &&
+      parts[1] <= 12 &&
+      parts[2] >= 1 &&
+      parts[2] <= 31
+    ) {
+      return clean;
+    }
+    return "";
+  };
+
   const getCriticalStatus = (task: Task) => {
     if (task.isForceCritical) {
       return {
@@ -1359,9 +1380,9 @@ export default function App() {
         isForced: true
       };
     }
-    if (!task.dropDeadDate) return null;
-    const dateParts = task.dropDeadDate.split("T")[0].split("-").map(Number);
-    if (dateParts.length < 3 || isNaN(dateParts[0])) return null;
+    const cleanDate = getValidDateString(task.dropDeadDate);
+    if (!cleanDate) return null;
+    const dateParts = cleanDate.split("-").map(Number);
     const taskMidnight = new Date(dateParts[0], dateParts[1] - 1, dateParts[2]);
     const currentMidnight = new Date(todayDateObj.getFullYear(), todayDateObj.getMonth(), todayDateObj.getDate());
     const diffTime = taskMidnight.getTime() - currentMidnight.getTime();
@@ -1389,10 +1410,10 @@ export default function App() {
     return null;
   };
 
-  const getDeadlineBadgeStyle = (dateStr?: string) => {
-    if (!dateStr) return null;
-    const dateParts = dateStr.split("T")[0].split("-").map(Number);
-    if (dateParts.length < 3 || isNaN(dateParts[0])) return null;
+  const getDeadlineBadgeStyle = (rawDateStr?: string) => {
+    const cleanDate = getValidDateString(rawDateStr);
+    if (!cleanDate) return null;
+    const dateParts = cleanDate.split("-").map(Number);
     const taskMidnight = new Date(dateParts[0], dateParts[1] - 1, dateParts[2]);
     const currentMidnight = new Date(todayDateObj.getFullYear(), todayDateObj.getMonth(), todayDateObj.getDate());
     const diffTime = taskMidnight.getTime() - currentMidnight.getTime();
@@ -1407,7 +1428,7 @@ export default function App() {
     } else if (diffDays <= 14) {
       return { text: `Drop-dead in ${diffDays}d`, color: "bg-amber-50 text-amber-800 border-amber-200" };
     } else {
-      return { text: `Due ${dateStr}`, color: "bg-neutral-50 text-neutral-600 border-neutral-200" };
+      return { text: `Due ${cleanDate}`, color: "bg-neutral-50 text-neutral-600 border-neutral-200" };
     }
   };
 
@@ -3991,25 +4012,45 @@ export default function App() {
 
                                       {/* Inline Quick Due Date Selector */}
                                       <div
-                                        className="inline-flex items-center gap-1.5 bg-neutral-100/90 border border-neutral-200/80 rounded-md px-2 py-0.5 text-[9px] font-mono transition-all"
+                                        className="inline-flex items-center gap-1.5 bg-neutral-100 border border-neutral-200/90 rounded-lg px-2 py-1 text-[10px] font-mono transition-all shadow-2xs flex-wrap sm:flex-nowrap"
                                         title="Click to edit due date directly"
                                       >
-                                        <Calendar className="w-3 h-3 text-neutral-600 shrink-0" />
-                                        <span className="text-neutral-600 font-bold uppercase tracking-wider">Due:</span>
+                                        <Calendar className="w-3.5 h-3.5 text-neutral-600 shrink-0" />
+                                        <span className="text-neutral-700 font-bold uppercase tracking-wider text-[10px]">Due:</span>
                                         <input
                                           type="date"
-                                          value={task.dropDeadDate || ""}
+                                          value={getValidDateString(task.dropDeadDate)}
                                           onChange={(e) => handleQuickUpdateDate(task.id, e.target.value)}
-                                          className="bg-white border border-neutral-300 rounded px-1 py-0.5 text-neutral-900 font-mono text-[10px] font-semibold cursor-pointer focus:outline-none focus:ring-1 focus:ring-neutral-900 w-[115px]"
+                                          className="bg-white border border-neutral-300 rounded px-1.5 py-0.5 text-neutral-900 font-mono text-xs font-bold cursor-pointer focus:outline-none focus:ring-1 focus:ring-neutral-900 w-[120px]"
                                         />
-                                        {task.dropDeadDate && (
+                                        <button
+                                          type="button"
+                                          onClick={() => handleQuickUpdateDate(task.id, todayStr)}
+                                          className="text-[9px] font-mono font-bold bg-white border border-neutral-200 hover:bg-neutral-50 text-neutral-700 px-1.5 py-0.5 rounded cursor-pointer"
+                                          title="Set due date to Today"
+                                        >
+                                          Today
+                                        </button>
+                                        <button
+                                          type="button"
+                                          onClick={() => {
+                                            const tmrw = new Date();
+                                            tmrw.setDate(tmrw.getDate() + 1);
+                                            handleQuickUpdateDate(task.id, tmrw.toISOString().split("T")[0]);
+                                          }}
+                                          className="text-[9px] font-mono font-bold bg-white border border-neutral-200 hover:bg-neutral-50 text-neutral-700 px-1.5 py-0.5 rounded cursor-pointer"
+                                          title="Set due date to Tomorrow"
+                                        >
+                                          Tmrw
+                                        </button>
+                                        {getValidDateString(task.dropDeadDate) && (
                                           <button
                                             type="button"
                                             onClick={() => handleQuickUpdateDate(task.id, "")}
-                                            className="text-neutral-400 hover:text-red-600 font-bold text-xs px-1 hover:bg-red-50 rounded transition-colors cursor-pointer"
+                                            className="text-neutral-500 hover:text-red-600 font-bold text-xs px-1.5 py-0.5 hover:bg-red-50 rounded transition-colors cursor-pointer"
                                             title="Clear due date"
                                           >
-                                            ×
+                                            Clear ×
                                           </button>
                                         )}
                                       </div>
@@ -4037,20 +4078,20 @@ export default function App() {
 
                                       {/* Force Critical Toggle Control */}
                                       <button
-                                        onClick={() => handleToggleForceCritical(task.id, task.isForceCritical)}
-                                        className={`text-[9px] font-mono px-2 py-0.5 rounded-md font-bold transition-all flex items-center gap-1 border cursor-pointer ${
+                                        onClick={() => handleToggleForceCritical(task.id, isTaskCritical)}
+                                        className={`text-[10px] font-mono px-2.5 py-1 rounded-lg font-bold transition-all flex items-center gap-1.5 border cursor-pointer shadow-2xs ${
                                           isTaskCritical
                                             ? "bg-red-100 text-red-900 border-red-300 hover:bg-red-200"
-                                            : "bg-neutral-50 text-neutral-400 border-neutral-200 hover:bg-neutral-100 hover:text-neutral-600"
+                                            : "bg-neutral-100 text-neutral-600 border-neutral-200 hover:bg-neutral-200/80"
                                         }`}
                                         title={
                                           isTaskCritical
-                                            ? "Click to remove from Critical Items (clears drop-dead date & critical flag)"
-                                            : "Click to flag as Critical Item"
+                                            ? "Click to UNFLAG critical (removes from Critical Items list instantly)"
+                                            : "Click to FLAG as critical item"
                                         }
                                       >
-                                        <Flame className={`w-3 h-3 ${isTaskCritical ? "text-red-600 fill-red-600" : "text-neutral-400"}`} />
-                                        {isTaskCritical ? "Unflag Critical" : "Flag Critical"}
+                                        <Flame className={`w-3.5 h-3.5 ${isTaskCritical ? "text-red-600 fill-red-600" : "text-neutral-500"}`} />
+                                        <span>{isTaskCritical ? "Unflag Critical" : "Flag Critical"}</span>
                                       </button>
                                     </div>
 
