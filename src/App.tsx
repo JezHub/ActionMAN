@@ -130,6 +130,17 @@ const detectTags = (title: string): string[] => {
   return tags;
 };
 
+// Parse the address / domain out of a raw RFC "From" header value
+const extractEmailAddress = (fromStr: string): string => {
+  const match = (fromStr || "").match(/<([^>]+)>/) || [null, fromStr];
+  return ((match[1] || fromStr) || "").trim().toLowerCase();
+};
+
+const extractEmailDomain = (address: string): string => {
+  const parts = address.split("@");
+  return parts[parts.length - 1]?.trim().toLowerCase() || "";
+};
+
 const calculateStringSimilarity = (s1: string, s2: string): number => {
   const clean1 = s1.trim().toLowerCase();
   const clean2 = s2.trim().toLowerCase();
@@ -209,11 +220,36 @@ export default function App() {
   });
   const [showMutedSettings, setShowMutedSettings] = useState(false);
 
+  // Latest ignore lists for callbacks whose closures may be stale (e.g. the
+  // triage fetch fired from the mount-time auth effect).
+  const emailFiltersRef = useRef({ ignoredSenders, ignoredDomains, ignoredEmails });
+  useEffect(() => {
+    emailFiltersRef.current = { ignoredSenders, ignoredDomains, ignoredEmails };
+  }, [ignoredSenders, ignoredDomains, ignoredEmails]);
+
+  // Mirror ignore lists to this device's localStorage whenever they change
+  useEffect(() => {
+    safeLocalStorage.setItem("ignored_senders", JSON.stringify(ignoredSenders));
+  }, [ignoredSenders]);
+  useEffect(() => {
+    safeLocalStorage.setItem("ignored_domains", JSON.stringify(ignoredDomains));
+  }, [ignoredDomains]);
+  useEffect(() => {
+    safeLocalStorage.setItem("ignored_emails", JSON.stringify(ignoredEmails));
+  }, [ignoredEmails]);
+
   // --- Persistent State ---
   const [tasks, setTasks] = useState<Task[]>(() => {
     const saved = safeLocalStorage.getItem("brain_dump_tasks");
     return saved ? JSON.parse(saved) : INITIAL_TASKS;
   });
+
+  // Latest tasks for async callbacks (coach review, etc.) that would otherwise
+  // operate on the stale list captured before their awaits
+  const tasksRef = useRef<Task[]>(tasks);
+  useEffect(() => {
+    tasksRef.current = tasks;
+  }, [tasks]);
 
   const [northStar, setNorthStar] = useState<NorthStar>(() => {
     const saved = safeLocalStorage.getItem("brain_dump_north_star");
@@ -251,46 +287,64 @@ export default function App() {
     }
   }, [dbStatus]);
 
+  // One-time guards for migrating pre-Firestore local data up to the cloud.
+  // "has_synced_with_firestore" marks that this device's localStorage is just a
+  // mirror of Firestore — after that, local-only tasks are never re-uploaded
+  // (re-uploading them is how deleted tasks used to resurrect across devices).
+  const hasEverSyncedRef = useRef(safeLocalStorage.getItem("has_synced_with_firestore") === "true");
+  const localTasksMigratedRef = useRef(false);
+  const localFiltersMigratedRef = useRef(false);
+
   useEffect(() => {
     let unsubscribeTasks: (() => void) | null = null;
     let unsubscribeNorthStar: (() => void) | null = null;
     let unsubscribeEmailFilters: (() => void) | null = null;
+    let unsubscribeBriefing: (() => void) | null = null;
 
     async function initFirebase() {
       try {
-        const { seedInitialTasksIfEmpty, subscribeTasks, subscribeNorthStar, subscribeEmailFilters } = await import("./lib/firebase");
+        const { seedInitialTasksIfEmpty, subscribeTasks, subscribeNorthStar, subscribeEmailFilters, subscribeBriefingSettings } = await import("./lib/firebase");
 
         // Seed initial tasks if empty on firestore in background (non-blocking)
         seedInitialTasksIfEmpty(INITIAL_TASKS, INITIAL_NORTH_STAR).catch((err) => {
           console.error("Firebase subscription seeding error:", err);
         });
 
-        // Subscribe to remote tasks
+        // Subscribe to remote tasks. Firestore (with its offline persistence)
+        // is the source of truth: snapshots REPLACE local state. The old
+        // union-merge re-uploaded anything left in another device's
+        // localStorage, which resurrected deleted tasks. The only exception is
+        // a one-time migration of pre-existing local tasks into an empty DB.
         unsubscribeTasks = subscribeTasks(
-          (remoteTasks) => {
-            if (remoteTasks && remoteTasks.length > 0) {
-              setTasks((prev) => {
-                const remoteIds = new Set(remoteTasks.map((rt) => rt.id));
-                const localOnly = prev.filter((lt) => !remoteIds.has(lt.id));
-                // Automatically upload any unsynced local tasks to Firestore
-                if (localOnly.length > 0) {
-                  import("./lib/firebase").then(({ saveTaskToDb }) => {
-                    localOnly.forEach((lt) => saveTaskToDb(lt));
-                  });
-                }
-                return [...remoteTasks, ...localOnly];
-              });
-            } else if (remoteTasks && remoteTasks.length === 0) {
-              setTasks((prev) => {
-                if (prev.length > 0) {
-                  import("./lib/firebase").then(({ saveTaskToDb }) => {
-                    prev.forEach((t) => saveTaskToDb(t));
-                  });
-                }
-                return prev;
-              });
+          (remoteTasks, fromCache) => {
+            const localTasks = tasksRef.current;
+            const isLegacyLocalOnlyData =
+              !hasEverSyncedRef.current && remoteTasks.length === 0 && localTasks.length > 0;
+
+            if (isLegacyLocalOnlyData) {
+              // This device has pre-Firestore tasks and the remote DB is empty:
+              // keep the local list and (once the server confirms the DB really
+              // is empty) migrate it up. Never wipe it with an empty snapshot.
+              if (!fromCache && !localTasksMigratedRef.current) {
+                localTasksMigratedRef.current = true;
+                import("./lib/firebase").then(({ saveTaskToDb }) => {
+                  localTasks.forEach((t) =>
+                    saveTaskToDb(t).catch((e) => {
+                      console.error("Error migrating local task to Firestore:", e);
+                      setDbStatus("error");
+                    })
+                  );
+                });
+              }
+            } else {
+              setTasks(remoteTasks);
             }
-            setDbStatus("synced");
+
+            if (!fromCache) {
+              hasEverSyncedRef.current = true;
+              safeLocalStorage.setItem("has_synced_with_firestore", "true");
+              setDbStatus("synced");
+            }
           },
           (err) => {
             console.error("Firebase subscription tasks error:", err);
@@ -313,18 +367,49 @@ export default function App() {
         // Subscribe to remote Email Filters (ignored senders, domains & specific emails)
         if (typeof subscribeEmailFilters === "function") {
           unsubscribeEmailFilters = subscribeEmailFilters(
-            (filters) => {
-              if (filters) {
+            (filters, exists) => {
+              if (exists) {
                 setIgnoredSenders(filters.ignoredSenders || []);
                 setIgnoredDomains(filters.ignoredDomains || []);
                 setIgnoredEmails(filters.ignoredEmails || []);
-                safeLocalStorage.setItem("ignored_senders", JSON.stringify(filters.ignoredSenders || []));
-                safeLocalStorage.setItem("ignored_domains", JSON.stringify(filters.ignoredDomains || []));
-                safeLocalStorage.setItem("ignored_emails", JSON.stringify(filters.ignoredEmails || []));
+              } else if (!localFiltersMigratedRef.current) {
+                // No remote doc yet: push this device's locally-stored filters
+                // up instead of wiping them.
+                localFiltersMigratedRef.current = true;
+                const local = emailFiltersRef.current;
+                if (local.ignoredSenders.length || local.ignoredDomains.length || local.ignoredEmails.length) {
+                  import("./lib/firebase").then(({ saveEmailFiltersToDb }) => {
+                    saveEmailFiltersToDb(local).catch((err) => {
+                      console.error("Failed to migrate local email filters to Firestore:", err);
+                    });
+                  });
+                }
               }
             },
             (err) => {
               console.error("Firebase subscription Email Filters error:", err);
+            }
+          );
+        }
+
+        // Subscribe to shared Morning Briefing settings so one device's send
+        // suppresses auto-sends from the others.
+        if (typeof subscribeBriefingSettings === "function") {
+          unsubscribeBriefing = subscribeBriefingSettings(
+            (settings) => {
+              if (typeof settings.autoSend === "boolean") {
+                setAutoSendDailySummary(settings.autoSend);
+                safeLocalStorage.setItem("auto_send_daily_summary", settings.autoSend ? "true" : "false");
+              }
+              if (settings.lastSentDate) {
+                setLastSentDailySummaryDate((prev) =>
+                  prev && prev >= settings.lastSentDate! ? prev : settings.lastSentDate!
+                );
+                safeLocalStorage.setItem("last_sent_daily_summary_date", settings.lastSentDate);
+              }
+            },
+            (err) => {
+              console.error("Firebase subscription Briefing settings error:", err);
             }
           );
         }
@@ -340,6 +425,7 @@ export default function App() {
       if (unsubscribeTasks) unsubscribeTasks();
       if (unsubscribeNorthStar) unsubscribeNorthStar();
       if (unsubscribeEmailFilters) unsubscribeEmailFilters();
+      if (unsubscribeBriefing) unsubscribeBriefing();
     };
   }, []);
 
@@ -348,9 +434,21 @@ export default function App() {
     let unsubscribeAuth: (() => void) | null = null;
     
     async function setupAuth() {
-      // 1. Try Direct Google Identity Services (GIS) first if stored in session
-      const storedGisToken = safeSessionStorage.getItem("gis_access_token");
+      // 1. Try Direct Google Identity Services (GIS) first if stored in session.
+      // readStoredGoogleToken discards tokens past their ~1h lifetime, so an
+      // expired session falls through to a fresh sign-in instead of restoring
+      // a token every Gmail call would reject.
+      let storedGisToken: string | null = null;
+      try {
+        const { readStoredGoogleToken } = await import("./lib/firebase");
+        storedGisToken = readStoredGoogleToken("gis_access_token");
+      } catch (e) {
+        console.error("Failed to load token helper:", e);
+      }
       const storedGisUser = safeSessionStorage.getItem("gis_user");
+      if (!storedGisToken && storedGisUser) {
+        safeSessionStorage.removeItem("gis_user");
+      }
       if (storedGisToken && storedGisUser) {
         try {
           const parsedUser = JSON.parse(storedGisUser);
@@ -493,16 +591,16 @@ export default function App() {
             setAccessToken(token);
             setNeedsAuth(false);
             
-            // Persist session locally to avoid re-prompting on simple refreshes
-            safeSessionStorage.setItem("gis_access_token", token);
+            // Persist session locally (with expiry) to avoid re-prompting on simple refreshes
             safeSessionStorage.setItem("gis_user", JSON.stringify(constructedUser));
 
             // Fetch triaged emails
             fetchTriagedEmails(token);
 
-            // Link Firebase Auth in background to authenticate Firestore
+            // Store the token with its expiry and link Firebase Auth in background
             import("./lib/firebase")
-              .then(({ signInWithGoogleToken }) => {
+              .then(({ storeGoogleToken, signInWithGoogleToken }) => {
+                storeGoogleToken("gis_access_token", token);
                 signInWithGoogleToken(token).catch((err) => {
                   console.warn("Failed to background sign-in Firebase Auth with GIS token:", err);
                 });
@@ -634,7 +732,7 @@ export default function App() {
         body: JSON.stringify({
           tasks,
           northStar,
-          triagedEmails,
+          triagedEmails: visibleTriagedEmails,
           dashboardUrl: window.location.href,
           userEmail: googleUser?.email
         })
@@ -684,10 +782,14 @@ export default function App() {
 
       setBriefingSentSuccess(true);
       setBriefingCoachCommentary(data.coachCommentary || "");
-      
-      const todayStr = new Date().toISOString().split("T")[0];
-      setLastSentDailySummaryDate(todayStr);
-      safeLocalStorage.setItem("last_sent_daily_summary_date", todayStr);
+
+      const sentDateStr = new Date().toLocaleDateString("en-CA");
+      setLastSentDailySummaryDate(sentDateStr);
+      safeLocalStorage.setItem("last_sent_daily_summary_date", sentDateStr);
+      // Share the sent date so other devices don't auto-send a duplicate today
+      import("./lib/firebase")
+        .then(({ saveBriefingSettingsToDb }) => saveBriefingSettingsToDb({ lastSentDate: sentDateStr }))
+        .catch((e) => console.error("Failed to sync briefing sent date:", e));
     } catch (err: any) {
       console.error("Error sending Focus Briefing:", err);
       let errMsg = err.message || "Something went wrong while sending your focus briefing.";
@@ -708,13 +810,13 @@ export default function App() {
   // Auto-send daily summary email on first login/load of the day
   useEffect(() => {
     if (googleUser && accessToken && autoSendDailySummary) {
-      const todayStr = new Date().toISOString().split("T")[0];
-      if (lastSentDailySummaryDate !== todayStr && !isBriefingSending && !briefingSentSuccess) {
+      const currentDateStr = new Date().toLocaleDateString("en-CA");
+      if (lastSentDailySummaryDate !== currentDateStr && !isBriefingSending && !briefingSentSuccess) {
         console.log("Detecting new day. Auto-sending Morning Focus Briefing...");
         handleSendDailyBriefing();
       }
     }
-  }, [googleUser, accessToken, autoSendDailySummary, lastSentDailySummaryDate]);
+  }, [googleUser, accessToken, autoSendDailySummary, lastSentDailySummaryDate, isBriefingSending, briefingSentSuccess]);
 
   const fetchTriagedEmails = async (tokenStr = accessToken) => {
     const currentToken = tokenStr || accessToken;
@@ -735,9 +837,9 @@ export default function App() {
         },
         body: JSON.stringify({
           currentDate: new Date().toLocaleDateString("en-CA"), // Dynamically calculate current local date (YYYY-MM-DD)
-          ignoredSenders,
-          ignoredDomains,
-          ignoredEmails
+          // Read via ref: this function is often invoked from mount-time
+          // closures whose captured state predates the Firestore filter sync
+          ...emailFiltersRef.current
         })
       });
 
@@ -798,119 +900,62 @@ export default function App() {
     }
   };
 
+  // All ignore/mute mutations use functional state updates (never stale
+  // closures) and atomic arrayUnion/arrayRemove writes in Firestore, so
+  // concurrent actions across tabs/devices can never clobber each other.
+  // The visible triage list is derived via visibleTriagedEmails, so entries
+  // disappear instantly and stay hidden on every synced device.
   const handleIgnoreSpecificEmail = async (emailId: string) => {
     if (!emailId) return;
-    const updatedEmails = [...ignoredEmails];
-    if (!updatedEmails.includes(emailId)) {
-      updatedEmails.push(emailId);
-    }
-
-    setIgnoredEmails(updatedEmails);
-    safeLocalStorage.setItem("ignored_emails", JSON.stringify(updatedEmails));
+    setIgnoredEmails((prev) => (prev.includes(emailId) ? prev : [...prev, emailId]));
 
     try {
-      const { saveEmailFiltersToDb } = await import("./lib/firebase");
-      await saveEmailFiltersToDb({
-        ignoredSenders,
-        ignoredDomains,
-        ignoredEmails: updatedEmails
-      });
+      const { addEmailFilterEntries } = await import("./lib/firebase");
+      await addEmailFilterEntries({ emails: [emailId] });
     } catch (err) {
       console.error("Failed to save email filters to remote DB:", err);
     }
-
-    // Immediately filter the active triagedEmails state
-    setTriagedEmails((prev) => prev.filter((item: any) => item.id !== emailId && item.emailId !== emailId));
   };
 
   const handleRemoveIgnoreSpecificEmail = async (emailId: string) => {
-    const updatedEmails = ignoredEmails.filter((id) => id !== emailId);
-    setIgnoredEmails(updatedEmails);
-    safeLocalStorage.setItem("ignored_emails", JSON.stringify(updatedEmails));
+    setIgnoredEmails((prev) => prev.filter((id) => id !== emailId));
 
     try {
-      const { saveEmailFiltersToDb } = await import("./lib/firebase");
-      await saveEmailFiltersToDb({
-        ignoredSenders,
-        ignoredDomains,
-        ignoredEmails: updatedEmails
-      });
+      const { removeEmailFilterEntries } = await import("./lib/firebase");
+      await removeEmailFilterEntries({ emails: [emailId] });
     } catch (err) {
       console.error("Failed to save email filters to remote DB:", err);
     }
   };
 
   const handleIgnoreEmailSource = async (email: any, ignoreType: "sender" | "domain") => {
-    const fromStr = email.from || "";
-    const emailMatch = fromStr.match(/<([^>]+)>/) || [null, fromStr];
-    const emailAddress = (emailMatch[1] || fromStr).trim().toLowerCase();
-    const domainParts = emailAddress.split("@");
-    const domain = domainParts[domainParts.length - 1]?.trim().toLowerCase() || "";
-
-    let updatedSenders = [...ignoredSenders];
-    let updatedDomains = [...ignoredDomains];
-
-    if (ignoreType === "sender" && emailAddress) {
-      if (!updatedSenders.includes(emailAddress)) {
-        updatedSenders.push(emailAddress);
-      }
-    } else if (ignoreType === "domain" && domain) {
-      if (!updatedDomains.includes(domain)) {
-        updatedDomains.push(domain);
-      }
-    }
-
-    setIgnoredSenders(updatedSenders);
-    setIgnoredDomains(updatedDomains);
-    safeLocalStorage.setItem("ignored_senders", JSON.stringify(updatedSenders));
-    safeLocalStorage.setItem("ignored_domains", JSON.stringify(updatedDomains));
+    const emailAddress = extractEmailAddress(email.from || "");
+    const domain = extractEmailDomain(emailAddress);
 
     try {
-      const { saveEmailFiltersToDb } = await import("./lib/firebase");
-      await saveEmailFiltersToDb({
-        ignoredSenders: updatedSenders,
-        ignoredDomains: updatedDomains,
-        ignoredEmails
-      });
+      const { addEmailFilterEntries } = await import("./lib/firebase");
+      if (ignoreType === "sender" && emailAddress) {
+        setIgnoredSenders((prev) => (prev.includes(emailAddress) ? prev : [...prev, emailAddress]));
+        await addEmailFilterEntries({ senders: [emailAddress] });
+      } else if (ignoreType === "domain" && domain) {
+        setIgnoredDomains((prev) => (prev.includes(domain) ? prev : [...prev, domain]));
+        await addEmailFilterEntries({ domains: [domain] });
+      }
     } catch (err) {
       console.error("Failed to save email filters to remote DB:", err);
     }
-
-    // Immediately filter the active triagedEmails state
-    setTriagedEmails((prev) => prev.filter((item: any) => {
-      const itemMatch = item.from.match(/<([^>]+)>/) || [null, item.from];
-      const itemAddress = (itemMatch[1] || item.from).trim().toLowerCase();
-      const itemDomainParts = itemAddress.split("@");
-      const itemDomain = itemDomainParts[itemDomainParts.length - 1]?.trim().toLowerCase() || "";
-
-      if (updatedSenders.includes(itemAddress)) return false;
-      if (updatedDomains.some((d: string) => itemDomain === d || itemDomain.endsWith("." + d))) return false;
-      return true;
-    }));
   };
 
   const handleRemoveIgnoreRule = async (value: string, ignoreType: "sender" | "domain") => {
-    let updatedSenders = [...ignoredSenders];
-    let updatedDomains = [...ignoredDomains];
-
-    if (ignoreType === "sender") {
-      updatedSenders = updatedSenders.filter((s) => s !== value);
-    } else if (ignoreType === "domain") {
-      updatedDomains = updatedDomains.filter((d) => d !== value);
-    }
-
-    setIgnoredSenders(updatedSenders);
-    setIgnoredDomains(updatedDomains);
-    safeLocalStorage.setItem("ignored_senders", JSON.stringify(updatedSenders));
-    safeLocalStorage.setItem("ignored_domains", JSON.stringify(updatedDomains));
-
     try {
-      const { saveEmailFiltersToDb } = await import("./lib/firebase");
-      await saveEmailFiltersToDb({
-        ignoredSenders: updatedSenders,
-        ignoredDomains: updatedDomains,
-        ignoredEmails
-      });
+      const { removeEmailFilterEntries } = await import("./lib/firebase");
+      if (ignoreType === "sender") {
+        setIgnoredSenders((prev) => prev.filter((s) => s !== value));
+        await removeEmailFilterEntries({ senders: [value] });
+      } else if (ignoreType === "domain") {
+        setIgnoredDomains((prev) => prev.filter((d) => d !== value));
+        await removeEmailFilterEntries({ domains: [value] });
+      }
     } catch (err) {
       console.error("Failed to save email filters to remote DB:", err);
     }
@@ -1063,6 +1108,7 @@ export default function App() {
       .then(({ saveTaskToDb }) => {
         saveTaskToDb(task).catch((e) => {
           console.error("Error saving task to Firestore in background:", e);
+          setDbStatus("error");
         });
       })
       .catch((e) => {
@@ -1145,6 +1191,7 @@ export default function App() {
       .then(({ deleteTaskFromDb }) => {
         deleteTaskFromDb(taskId).catch((e) => {
           console.error("Error deleting task from Firestore in background:", e);
+          setDbStatus("error");
         });
       })
       .catch((e) => {
@@ -1236,8 +1283,11 @@ export default function App() {
   const [editPriorityInput, setEditPriorityInput] = useState<Task["priority"]>("medium");
 
   // --- Helper Date Calculations ---
-  const todayStr = "2026-07-15"; // matches metadata current local time
-  const todayDateObj = new Date(todayStr);
+  // Always derive "today" from the real clock — this was previously frozen at
+  // a hardcoded date, which silently broke every deadline countdown and all
+  // relative-date parsing ("by Friday") from that day onward.
+  const todayDateObj = new Date();
+  const todayStr = todayDateObj.toLocaleDateString("en-CA");
 
   const getCriticalStatus = (task: Task) => {
     if (task.isForceCritical) {
@@ -1430,46 +1480,28 @@ export default function App() {
       const data: DailyCoachFeedback = await response.json();
       setCoachFeedback(data);
 
-      // Update the local tasks today status based on coach recommendation
-      const updatedTasks = tasks.map((t) => {
-        if (t.horizon === "today") {
-          const isMust = data.mustDoIds.includes(t.id);
-          const isNice = data.niceToDoIds.includes(t.id);
-          return {
-            ...t,
-            isMustDo: isMust,
-            isNiceToDo: isNice || !isMust // default remaining to nice to do
-          };
-        }
-        return t;
-      });
-
-      setTasks(updatedTasks);
-      for (const t of updatedTasks) {
-        if (t.horizon === "today") {
-          await saveTask(t);
-        }
+      // Re-read the LATEST tasks (the coach round-trip takes seconds; mapping
+      // the pre-request task list here used to clobber any edit that landed in
+      // the meantime). saveTask applies a functional state update + persists.
+      for (const t of tasksRef.current.filter((t) => t.horizon === "today")) {
+        const isMust = data.mustDoIds.includes(t.id);
+        const isNice = data.niceToDoIds.includes(t.id);
+        await saveTask({
+          ...t,
+          isMustDo: isMust,
+          isNiceToDo: isNice || !isMust // default remaining to nice to do
+        });
       }
     } catch (err) {
       console.error(err);
       // Fallback: manually divide them based on priority
-      const fallbackTasks = tasks.map((t) => {
-        if (t.horizon === "today") {
-          const isMust = t.priority === "high" || t.category === "north_star";
-          return {
-            ...t,
-            isMustDo: isMust,
-            isNiceToDo: !isMust
-          };
-        }
-        return t;
-      });
-
-      setTasks(fallbackTasks);
-      for (const t of fallbackTasks) {
-        if (t.horizon === "today") {
-          await saveTask(t);
-        }
+      for (const t of tasksRef.current.filter((t) => t.horizon === "today")) {
+        const isMust = t.priority === "high" || t.category === "north_star";
+        await saveTask({
+          ...t,
+          isMustDo: isMust,
+          isNiceToDo: !isMust
+        });
       }
 
       setCoachFeedback({
@@ -1793,6 +1825,22 @@ export default function App() {
         return diffA - diffB;
       });
   }, [tasks]);
+
+  // Triage results actually shown: always re-filtered against the CURRENT
+  // ignore lists. The server also pre-filters, but this guarantees that an
+  // ignore action (from this or any synced device) takes effect immediately,
+  // even for results fetched before the Firestore filters arrived.
+  const visibleTriagedEmails = useMemo(() => {
+    return triagedEmails.filter((email: any) => {
+      const id = email.emailId || email.id;
+      if (id && ignoredEmails.includes(id)) return false;
+      const address = extractEmailAddress(email.from || "");
+      if (ignoredSenders.includes(address)) return false;
+      const domain = extractEmailDomain(address);
+      if (ignoredDomains.some((d) => domain === d || domain.endsWith("." + d))) return false;
+      return true;
+    });
+  }, [triagedEmails, ignoredSenders, ignoredDomains, ignoredEmails]);
 
   // Authorized email list (matching requested email 'jazz@smallathon.com' and the dev/workspace email 'jez@smileathon.com')
   const allowedEmails = ["jazz@smallathon.com", "jez@smileathon.com"];
@@ -2256,9 +2304,9 @@ export default function App() {
                     >
                       <Mail className="w-3.5 h-3.5" />
                       <span>Email Triage</span>
-                      {triagedEmails.length > 0 && (
+                      {visibleTriagedEmails.length > 0 && (
                         <span className="absolute -top-1.5 -right-1.5 px-1.5 py-0.25 bg-amber-500 text-neutral-950 font-black rounded-full text-[8px] font-mono shadow border border-white">
-                          {triagedEmails.length}
+                          {visibleTriagedEmails.length}
                         </span>
                       )}
                     </button>
@@ -2313,7 +2361,7 @@ export default function App() {
                       <div>
                         <h2 className="text-lg font-bold text-neutral-900 font-display">Email Triage Control Room</h2>
                         <p className="text-xs text-neutral-500 mt-1">
-                          AI-powered real-time parsing of your Gmail inbox (last 7 days) for high-velocity action conversion.
+                          AI-powered real-time parsing of your Gmail inbox (last 14 days) for high-velocity action conversion.
                         </p>
                       </div>
                     </div>
@@ -2346,7 +2394,7 @@ export default function App() {
                       <div>
                         <h3 className="text-base font-bold text-neutral-900 font-display">Connect your Gmail Inbox</h3>
                         <p className="text-xs text-neutral-500 mt-2 max-w-md mx-auto leading-relaxed">
-                          We scan the last 7 days of your inbox using secure Google OAuth and Gemini to automatically filter out spam/newsletters and isolate renewals, bill reminders, and high-importance client requests.
+                          We scan the last 14 days of your inbox using secure Google OAuth and Gemini to automatically filter out spam/newsletters and isolate renewals, bill reminders, and high-importance client requests.
                         </p>
                       </div>
 
@@ -2398,7 +2446,7 @@ export default function App() {
                           {/* Actions and sync panel */}
                           <div className="flex justify-between items-center bg-white rounded-2xl border border-neutral-200 p-4 shadow-sm">
                             <div className="text-xs text-neutral-500 font-semibold uppercase tracking-wider font-mono">
-                              {triagedEmails.length > 0 ? `${triagedEmails.length} Actionable Items Surfaced` : "Ready to Triage"}
+                              {visibleTriagedEmails.length > 0 ? `${visibleTriagedEmails.length} Actionable Items Surfaced` : "Ready to Triage"}
                             </div>
                             <button
                               onClick={() => fetchTriagedEmails()}
@@ -2524,7 +2572,7 @@ export default function App() {
                             </div>
                           )}
 
-                          {!isTriageLoading && !triageError && triagedEmails.length === 0 && (
+                          {!isTriageLoading && !triageError && visibleTriagedEmails.length === 0 && (
                             <div className="bg-white rounded-2xl border border-neutral-200 p-12 text-center shadow-sm flex flex-col items-center gap-4 max-w-xl mx-auto w-full my-6 animate-fade-in">
                               <div className="w-12 h-12 bg-emerald-50 rounded-xl flex items-center justify-center text-emerald-600">
                                 <CheckCircle2 className="w-6 h-6" />
@@ -2532,7 +2580,7 @@ export default function App() {
                               <div>
                                 <h4 className="text-sm font-bold text-neutral-900 font-display">Inbox Zero Actionable Items!</h4>
                                 <p className="text-xs text-neutral-400 mt-2 leading-relaxed">
-                                  No critical renewals, bills, or high-urgency client requests were detected in your inbox for the last 7 days. Your slate is clean!
+                                  No critical renewals, bills, or high-urgency client requests were detected in your inbox for the last 14 days. Your slate is clean!
                                 </p>
                               </div>
                               <button
@@ -2544,9 +2592,9 @@ export default function App() {
                             </div>
                           )}
 
-                          {!isTriageLoading && !triageError && triagedEmails.length > 0 && (
+                          {!isTriageLoading && !triageError && visibleTriagedEmails.length > 0 && (
                             <div className="grid grid-cols-1 md:grid-cols-2 gap-6 animate-fade-in">
-                              {triagedEmails.map((email: any) => {
+                              {visibleTriagedEmails.map((email: any) => {
                                 const isConverted = convertedEmailIds.includes(email.emailId);
                                 return (
                                   <div
@@ -2712,6 +2760,9 @@ export default function App() {
                                     const val = e.target.checked;
                                     setAutoSendDailySummary(val);
                                     safeLocalStorage.setItem("auto_send_daily_summary", val ? "true" : "false");
+                                    import("./lib/firebase")
+                                      .then(({ saveBriefingSettingsToDb }) => saveBriefingSettingsToDb({ autoSend: val }))
+                                      .catch((err) => console.error("Failed to sync briefing settings:", err));
                                   }}
                                   className="w-4 h-4 rounded border-neutral-300 text-neutral-900 focus:ring-neutral-900"
                                 />
@@ -2849,7 +2900,7 @@ export default function App() {
                                   <div className="flex justify-between items-center py-1.5">
                                     <span className="text-neutral-500">Triaged Email Alerts:</span>
                                     <span className="font-bold text-amber-600 font-mono">
-                                      {triagedEmails.length}
+                                      {visibleTriagedEmails.length}
                                     </span>
                                   </div>
                                 </div>
@@ -2947,8 +2998,8 @@ export default function App() {
                                     <div className="font-bold font-mono text-[9px] tracking-wider text-neutral-400 uppercase mb-2">
                                       3. UNRESOLVED GMAIL ACTIONS
                                     </div>
-                                    {triagedEmails.length > 0 ? (
-                                      triagedEmails.map((e, idx) => (
+                                    {visibleTriagedEmails.length > 0 ? (
+                                      visibleTriagedEmails.map((e, idx) => (
                                         <div key={idx} className="border-b border-neutral-50 py-2.5 text-xs">
                                           <div className="text-[9px] font-mono text-neutral-400 mb-0.5">FROM: {e.from}</div>
                                           <div className="flex items-center gap-1.5 flex-wrap">
