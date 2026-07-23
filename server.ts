@@ -136,7 +136,7 @@ Identify date importance, priority level, target time horizon, categories, and t
 Please parse every single distinct line, item, or thought from the above text into a structured JSON list of individual items. Remember: do not omit, skip, summarize, or truncate any tasks! Output all parsed items.`;
 
     const response = await generateWithRetry(ai, {
-      model: "gemini-3.5-flash",
+      model: "gemini-3.6-flash",
       contents: prompt,
       config: {
         systemInstruction,
@@ -214,7 +214,7 @@ ${JSON.stringify(
 Please recommend which of these should be "Must-dos" and "Nice-to-dos" for today, and write my daily coaching feedback message.`;
 
     const response = await generateWithRetry(ai, {
-      model: "gemini-3.5-flash",
+      model: "gemini-3.6-flash",
       contents: prompt,
       config: {
         systemInstruction,
@@ -435,7 +435,7 @@ ${JSON.stringify(filteredEmails)}
 Please triage these and return ONLY the genuinely important, highly actionable ones as a JSON array of objects. Current date is: ${currentDate || "2026-07-20"}.`;
 
     const response = await generateWithRetry(ai, {
-      model: "gemini-3.5-flash",
+      model: "gemini-3.6-flash",
       contents: prompt,
       config: {
         systemInstruction,
@@ -542,7 +542,7 @@ ${JSON.stringify(activeEmails.map((e: any) => ({ title: e.suggestedTitle, reason
 Please write my daily morning focus coaching summary.`;
 
     const aiResponse = await generateWithRetry(ai, {
-      model: "gemini-3.5-flash",
+      model: "gemini-3.6-flash",
       contents: prompt,
       config: {
         systemInstruction,
