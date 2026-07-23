@@ -1,5 +1,4 @@
-// Bump this on any caching-strategy change so old caches are purged on activate.
-const CACHE_NAME = "action-man-v2";
+const CACHE_NAME = "action-man-v1";
 const ASSETS = [
   "/",
   "/index.html",
@@ -43,47 +42,23 @@ self.addEventListener("fetch", (event) => {
     return;
   }
 
-  const isNavigation =
-    event.request.mode === "navigate" || event.request.destination === "document";
-
-  // App shell: NETWORK-FIRST. Serving cached index.html unconditionally froze
-  // devices on old builds forever (the cached HTML references old hashed
-  // bundles). The cache is only a fallback for offline use.
-  if (isNavigation) {
-    event.respondWith(
-      fetch(event.request)
-        .then((response) => {
-          if (response && response.status === 200) {
-            const responseToCache = response.clone();
-            caches.open(CACHE_NAME).then((cache) => {
-              cache.put(event.request, responseToCache);
-            });
-          }
-          return response;
-        })
-        .catch(() =>
-          caches.match(event.request).then((cached) => cached || caches.match("/index.html"))
-        )
-    );
-    return;
-  }
-
-  // Static assets (hashed bundles, icons): stale-while-revalidate — serve the
-  // cache immediately, refresh it in the background.
   event.respondWith(
     caches.match(event.request).then((cachedResponse) => {
-      const networkFetch = fetch(event.request)
-        .then((response) => {
-          if (response && response.status === 200 && response.type === "basic") {
-            const responseToCache = response.clone();
-            caches.open(CACHE_NAME).then((cache) => {
-              cache.put(event.request, responseToCache);
-            });
-          }
+      if (cachedResponse) {
+        return cachedResponse;
+      }
+      return fetch(event.request).then((response) => {
+        if (!response || response.status !== 200 || response.type !== "basic") {
           return response;
-        })
-        .catch(() => cachedResponse);
-      return cachedResponse || networkFetch;
+        }
+        const responseToCache = response.clone();
+        caches.open(CACHE_NAME).then((cache) => {
+          cache.put(event.request, responseToCache);
+        });
+        return response;
+      }).catch(() => {
+        // Fallback for offline API/HTML
+      });
     })
   );
 });
