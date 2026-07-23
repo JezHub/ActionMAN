@@ -86,14 +86,31 @@ async function generateWithRetry(ai: GoogleGenAI, config: any, maxRetries = 3) {
   }
 }
 
+// Resolve a YYYY-MM-DD date string (or fall back to the server clock) into
+// the pieces the prompts need. Never hardcode dates in prompts — relative
+// deadline parsing ("by Friday") breaks permanently once the date goes stale.
+const DAY_NAMES = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+function resolveDateContext(currentDate?: string) {
+  let ref = new Date();
+  if (currentDate) {
+    const parsed = Date.parse(currentDate);
+    if (!isNaN(parsed)) ref = new Date(parsed);
+  }
+  const iso = ref.toISOString().split("T")[0];
+  const dayName = DAY_NAMES[ref.getUTCDay()];
+  const tomorrowIso = new Date(ref.getTime() + 24 * 60 * 60 * 1000).toISOString().split("T")[0];
+  return { iso, dayName, tomorrowIso };
+}
+
 // 1. API: Organize Brain Dump
 app.post("/api/organize-dump", async (req, res) => {
-  const { dumpText, currentDate, northStar } = req.body || {};
   try {
+    const { dumpText, currentDate, northStar } = req.body;
     if (!dumpText || !dumpText.trim()) {
       return res.status(400).json({ error: "No brain dump text provided." });
     }
 
+    const dateCtx = resolveDateContext(currentDate);
     const ai = getGeminiClient();
 
     const systemInstruction = `You are an expert personal productivity assistant for "Action Man", a raw brain-dump planning app. Your job is to parse a raw "brain dump" text block into clean, actionable, individual items (ideas, tasks, or reminders).
@@ -117,12 +134,10 @@ Identify date importance, priority level, target time horizon, categories, and t
    - 'high': Reserve this ONLY if the user explicitly mentions the task is "critical", "urgent", "must do", "high priority", "vital", "ASAP", or if it has an explicit immediate drop-dead deadline written in the text.
    - 'medium': This MUST BE THE DEFAULT for standard to-dos, payments, bookings, chores, or reminders that lack explicit "critical" or "urgent" keywords.
    - 'low': Use for nice-to-haves, reference ideas, books to read, or long-term backlog reminders.
-4. Extract drop-dead dates: If the user explicitly mentions a specific due date, deadline, or clear drop-dead constraint (e.g. "by Friday", "tomorrow", "compliance taxes by Friday", "due July 20th"), calculate that date as an ISO string YYYY-MM-DD. 
-   Use the current date context: "${currentDate || '2026-07-15'} (Wednesday)". 
-   For example, if current is 2026-07-15:
-   - "tomorrow" is 2026-07-16
-   - "by Friday" is 2026-07-17
-   - "by Sunday" is 2026-07-19
+4. Extract drop-dead dates: If the user explicitly mentions a specific due date, deadline, or clear drop-dead constraint (e.g. "by Friday", "tomorrow", "compliance taxes by Friday", "due July 20th"), calculate that date as an ISO string YYYY-MM-DD.
+   Use the current date context: today is ${dateCtx.iso} (${dateCtx.dayName}).
+   - "tomorrow" is ${dateCtx.tomorrowIso}
+   - A weekday reference like "by Friday" means the NEXT occurrence of that weekday strictly after today (${dateCtx.iso}); compute the exact date from today's day of week.
    CRITICAL DROP-DEAD RULE: If the user line did NOT explicitly mention a day of the week, relative time (like "tomorrow" or "Friday"), or explicit deadline word in the text, you MUST leave the 'dropDeadDate' field as null. Do NOT invent, guess, estimate, or assume any default due date. For example, "Helens Capital gains payment", "Book my blood tests with the doc", "Sort the battery for the boat", or "Clean the boat" have NO mention of time, so their dropDeadDate MUST BE null.
 5. Auto-tagging rules:
    - If the task relates to "Rain Ventures", add "Rain Ventures" to the tags.
@@ -164,33 +179,11 @@ Please parse every single distinct line, item, or thought from the above text in
       },
     });
 
-    const rawParsed = JSON.parse(response.text || "[]");
-    const parsedData = Array.isArray(rawParsed) ? rawParsed.map((item: any) => ({
-      ...item,
-      dropDeadDate: (item.dropDeadDate && typeof item.dropDeadDate === "string" && item.dropDeadDate !== "null" && item.dropDeadDate !== "undefined" && item.dropDeadDate.trim() !== "") ? item.dropDeadDate.trim() : null
-    })) : [];
+    const parsedData = JSON.parse(response.text || "[]");
     res.json({ items: parsedData });
   } catch (error: any) {
-    console.error("Error organizing brain dump with Gemini, using fallback parser:", error);
-    const lines = dumpText.split(/\n+/).map((l: string) => l.replace(/^[-*•\d.\s]+/, "").trim()).filter((l: string) => l.length > 0);
-    const fallbackItems = lines.map((line: string) => ({
-      title: line,
-      priority: "medium",
-      horizon: "this_week",
-      category: "general",
-      dropDeadDate: null,
-      reasoning: "Processed from brain dump.",
-      tags: []
-    }));
-    res.json({ items: fallbackItems.length > 0 ? fallbackItems : [{
-      title: dumpText.trim(),
-      priority: "medium",
-      horizon: "this_week",
-      category: "general",
-      dropDeadDate: null,
-      reasoning: "Processed from brain dump.",
-      tags: []
-    }] });
+    console.error("Error organizing brain dump:", error);
+    res.status(500).json({ error: error.message || "Failed to organize brain dump." });
   }
 });
 
@@ -318,12 +311,14 @@ app.post("/api/triage-emails", async (req, res) => {
     const mm = String(fourteenDaysAgo.getMonth() + 1).padStart(2, "0");
     const dd = String(fourteenDaysAgo.getDate()).padStart(2, "0");
     
-    // We filter for primary/human conversations and specific action-oriented/financial keywords,
-    // while excluding promotions, social alerts, and common noreply addresses.
-    // This ensures we capture the full 14-day history (including accountant emails and invoices) without hitting truncation limits.
-    const query = `in:inbox after:${yyyy}-${mm}-${dd} (category:primary OR "invoice" OR "bill" OR "renew" OR "payment" OR "tax" OR "accountant") -category:promotions -category:social -from:noreply -from:no-reply`;
+    // Exclude only the noisy categories. Do NOT exclude noreply senders or
+    // restrict to category:primary — bills, renewals, and hosting/domain
+    // notices arrive from noreply@ addresses in the Updates category, which is
+    // exactly the mail this triage is supposed to surface. Gemini handles the
+    // noise filtering downstream.
+    const query = `in:inbox after:${yyyy}-${mm}-${dd} -category:promotions -category:social -category:forums`;
 
-    const listUrl = `https://gmail.googleapis.com/gmail/v1/users/me/messages?maxResults=250&q=${encodeURIComponent(query)}`;
+    const listUrl = `https://gmail.googleapis.com/gmail/v1/users/me/messages?maxResults=500&q=${encodeURIComponent(query)}`;
     
     console.log(`Fetching messages from Gmail with query: ${query} (Targeting Date: ${currentDate})`);
     const listRes = await fetch(listUrl, {
@@ -347,32 +342,40 @@ app.post("/api/triage-emails", async (req, res) => {
       return res.json({ importantEmails: [] });
     }
 
-    // Fetch details for the first 45 messages (safely handling rate/payload constraints and preventing timeouts)
-    // Slicing at 45 combined with the pre-filtered search query is more than sufficient for the 14-day triage.
-    const activeMessages = messages.slice(0, 45);
-    console.log(`Fetching detailed headers for the top ${activeMessages.length} messages in optimized batches...`);
-    
-    const detailedEmails: any[] = [];
-    const messageChunks = chunkArray(activeMessages, 15);
+    // Drop specifically-ignored message IDs BEFORE capping, so muted mail
+    // never consumes analysis slots, then fetch details for the newest batch.
+    const DETAIL_FETCH_CAP = 150;
+    const candidateMessages = messages
+      .filter((msg) => !ignoredEmails.includes(msg.id))
+      .slice(0, DETAIL_FETCH_CAP);
+    if (messages.length > candidateMessages.length + ignoredEmails.length) {
+      console.warn(`Triage window truncated: ${messages.length} matches, detail-fetching newest ${candidateMessages.length}.`);
+    }
+    console.log(`Fetching detailed headers for ${candidateMessages.length} messages in optimized batches...`);
 
-    for (const chunk of messageChunks) {
-      const chunkPromises = chunk.map(async (msg) => {
+    const fetchDetail = async (msg: { id: string }) => {
+      // Two attempts with a generous timeout — a slow Gmail response must not
+      // silently drop an email from the triage.
+      for (let attempt = 1; attempt <= 2; attempt++) {
         try {
           const detailUrl = `https://gmail.googleapis.com/gmail/v1/users/me/messages/${msg.id}?format=metadata&metadataHeaders=Subject&metadataHeaders=From&metadataHeaders=Date`;
           const detailRes = await fetchWithTimeout(detailUrl, {
             headers: {
               Authorization: authHeader,
             },
-          }, 2000); // 2-second timeout
-          
-          if (!detailRes.ok) return null;
+          }, 8000);
+
+          if (!detailRes.ok) {
+            if (detailRes.status === 429 || detailRes.status >= 500) continue;
+            return null;
+          }
           const detail = (await detailRes.json()) as any;
-          
+
           const headers = detail.payload?.headers || [];
           const subject = headers.find((h: any) => h.name.toLowerCase() === "subject")?.value || "(No Subject)";
           const from = headers.find((h: any) => h.name.toLowerCase() === "from")?.value || "(Unknown)";
           const date = headers.find((h: any) => h.name.toLowerCase() === "date")?.value || "";
-          
+
           return {
             id: msg.id,
             snippet: detail.snippet || "",
@@ -381,12 +384,17 @@ app.post("/api/triage-emails", async (req, res) => {
             date,
           };
         } catch (err: any) {
-          console.warn(`Error or timeout fetching email detail for ${msg.id}: ${err.message || err}`);
-          return null;
+          console.warn(`Attempt ${attempt} failed fetching email detail for ${msg.id}: ${err.message || err}`);
         }
-      });
+      }
+      console.warn(`Dropping email ${msg.id} from triage after repeated fetch failures.`);
+      return null;
+    };
 
-      const chunkResults = await Promise.all(chunkPromises);
+    const detailedEmails: any[] = [];
+    const messageChunks = chunkArray(candidateMessages, 20);
+    for (const chunk of messageChunks) {
+      const chunkResults = await Promise.all(chunk.map(fetchDetail));
       detailedEmails.push(...chunkResults.filter(Boolean));
     }
 
@@ -443,7 +451,7 @@ CRITICAL SELECTIVITY MANDATES:
 5. ALWAYS SURFACE any emails from accountants, tax advisors, or financial professionals (e.g., "Frankie", "Franky", "Accountant", "Tax office") chasing for information, approvals, or files. These are extremely critical and MUST always be surfaced as "high" priority.
 
 For each email you decide is genuinely important/actionable, return:
-1. 'emailId': the exact ID of the email.
+1. 'index': the exact numeric 'index' value of that email as given in the input list. Never invent an index.
 2. 'suggestedTitle': a crisp, action-oriented task title (e.g., "Pay credit card bill", "Renew website domain", "Approve Rain Ventures Agreement", "Respond to John's design request").
 3. 'importanceReason': a clear, objective 1-sentence explanation of why this was flagged and any deadlines (e.g., "Hosting renews automatically on July 20th for $15.00").
 4. 'suggestedCategory': must be one of: 'north_star', 'marketing', 'maintenance', 'personal', 'general'.
@@ -451,10 +459,26 @@ For each email you decide is genuinely important/actionable, return:
 6. 'suggestedHorizon': must be one of: 'today', 'tomorrow', 'this_week', 'this_month', 'backlog'.
 7. 'suggestedDate': YYYY-MM-DD due date if mentioned or strongly implied; otherwise leave null or omit.`;
 
-    const prompt = `Here are the active, pre-filtered emails from the last 14 days:
-${JSON.stringify(filteredEmails)}
+    // Cap the Gemini payload, and identify emails by their position in the
+    // list rather than the raw Gmail message ID — models reliably echo a small
+    // integer, but mangle long opaque IDs, which broke ignore persistence.
+    const GEMINI_EMAIL_CAP = 100;
+    const emailsForAnalysis = filteredEmails.slice(0, GEMINI_EMAIL_CAP);
+    if (filteredEmails.length > emailsForAnalysis.length) {
+      console.warn(`Sending newest ${emailsForAnalysis.length} of ${filteredEmails.length} filtered emails to Gemini.`);
+    }
+    const dateCtx = resolveDateContext(currentDate);
 
-Please triage these and return ONLY the genuinely important, highly actionable ones as a JSON array of objects. Current date is: ${currentDate || "2026-07-20"}.`;
+    const prompt = `Here are the active, pre-filtered emails from the last 14 days:
+${JSON.stringify(emailsForAnalysis.map((e: any, index: number) => ({
+      index,
+      from: e.from,
+      subject: e.subject,
+      date: e.date,
+      snippet: e.snippet,
+    })))}
+
+Please triage these and return ONLY the genuinely important, highly actionable ones as a JSON array of objects, each referencing the email by its 'index'. Current date is: ${dateCtx.iso} (${dateCtx.dayName}).`;
 
     const response = await generateWithRetry(ai, {
       model: "gemini-3.6-flash",
@@ -467,7 +491,7 @@ Please triage these and return ONLY the genuinely important, highly actionable o
           items: {
             type: Type.OBJECT,
             properties: {
-              emailId: { type: Type.STRING },
+              index: { type: Type.INTEGER },
               suggestedTitle: { type: Type.STRING },
               importanceReason: { type: Type.STRING },
               suggestedCategory: { type: Type.STRING },
@@ -475,7 +499,7 @@ Please triage these and return ONLY the genuinely important, highly actionable o
               suggestedHorizon: { type: Type.STRING },
               suggestedDate: { type: Type.STRING },
             },
-            required: ["emailId", "suggestedTitle", "importanceReason", "suggestedCategory", "suggestedPriority", "suggestedHorizon"],
+            required: ["index", "suggestedTitle", "importanceReason", "suggestedCategory", "suggestedPriority", "suggestedHorizon"],
           },
         },
       },
@@ -483,17 +507,28 @@ Please triage these and return ONLY the genuinely important, highly actionable o
 
     const triageResults = JSON.parse(response.text || "[]");
 
-    // Map back headers and snippet details
-    const importantEmails = triageResults.map((item: any) => {
-      const orig = filteredEmails.find((e: any) => e.id === item.emailId);
-      return {
-        ...item,
-        subject: orig?.subject || "",
-        from: orig?.from || "",
-        date: orig?.date || "",
-        snippet: orig?.snippet || "",
-      };
-    });
+    // Map indices back to the real Gmail messages; drop anything referencing
+    // an index we never sent, and dedupe repeated picks of the same email.
+    const seenIds = new Set<string>();
+    const importantEmails = triageResults
+      .map((item: any) => {
+        const orig = Number.isInteger(item.index) ? emailsForAnalysis[item.index] : undefined;
+        if (!orig || seenIds.has(orig.id)) {
+          if (!orig) console.warn(`Dropping triage result with unknown index: ${item.index}`);
+          return null;
+        }
+        seenIds.add(orig.id);
+        const { index, ...rest } = item;
+        return {
+          ...rest,
+          emailId: orig.id,
+          subject: orig.subject,
+          from: orig.from,
+          date: orig.date,
+          snippet: orig.snippet,
+        };
+      })
+      .filter(Boolean);
 
     res.json({ importantEmails });
   } catch (error: any) {
@@ -538,8 +573,9 @@ app.post("/api/send-daily-summary", async (req, res) => {
     const activeEmails = Array.isArray(triagedEmails) ? triagedEmails : [];
     const currentNorthStar = northStar || { title: "Not specified", description: "Not specified" };
 
-    // Get today's tasks specifically
-    const todayTasks = activeTasks.filter((t: any) => t.horizon === "today");
+    // Get today's still-open tasks specifically (completed ones must not be
+    // re-listed as must-dos in the morning briefing)
+    const todayTasks = activeTasks.filter((t: any) => t.horizon === "today" && !t.completed);
     const mustDos = todayTasks.filter((t: any) => t.isMustDo || t.priority === "high");
     const niceToDos = todayTasks.filter((t: any) => !t.isMustDo && t.priority !== "high");
 

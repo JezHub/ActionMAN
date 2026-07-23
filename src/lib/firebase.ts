@@ -1,15 +1,18 @@
 import { initializeApp } from "firebase/app";
 import {
-  getFirestore,
+  initializeFirestore,
+  persistentLocalCache,
+  persistentMultipleTabManager,
   collection,
   doc,
   setDoc,
+  getDoc,
   deleteDoc,
   getDocs,
   onSnapshot,
   writeBatch,
-  query,
-  orderBy
+  arrayUnion,
+  arrayRemove
 } from "firebase/firestore";
 import firebaseConfig from "../../firebase-applet-config.json";
 import { Task, NorthStar } from "../types";
@@ -17,11 +20,16 @@ import { Task, NorthStar } from "../types";
 // Initialize Firebase
 const app = initializeApp(firebaseConfig);
 
-// Initialize Firestore (handle custom database ID if present)
+// Initialize Firestore (handle custom database ID if present).
+// Persistent local cache lets the SDK queue writes made while offline and
+// replay them on reconnect, which is what keeps tasks from being lost.
 const config = firebaseConfig as any;
+const firestoreSettings = {
+  localCache: persistentLocalCache({ tabManager: persistentMultipleTabManager() })
+};
 export const db = config.firestoreDatabaseId
-  ? getFirestore(app, config.firestoreDatabaseId)
-  : getFirestore(app);
+  ? initializeFirestore(app, firestoreSettings, config.firestoreDatabaseId)
+  : initializeFirestore(app, firestoreSettings);
 
 // Collection References
 const TASKS_COLL = "tasks";
@@ -32,10 +40,16 @@ const NORTH_STAR_DOC = "north_star";
  * Syncs the tasks list in real-time from Firestore.
  * Fallback to local state if offline or during loading.
  */
-export function subscribeTasks(onUpdate: (tasks: Task[]) => void, onError: (err: any) => void) {
-  const q = query(collection(db, TASKS_COLL), orderBy("createdAt", "desc"));
+export function subscribeTasks(
+  onUpdate: (tasks: Task[], fromCache: boolean) => void,
+  onError: (err: any) => void
+) {
+  // NOTE: no orderBy() here on purpose — Firestore silently excludes documents
+  // that are missing the ordered field, which made legacy tasks without a
+  // createdAt vanish from the app. We sort client-side instead.
   return onSnapshot(
-    q,
+    collection(db, TASKS_COLL),
+    { includeMetadataChanges: true },
     (snapshot) => {
       const tasksList: Task[] = [];
       snapshot.forEach((docSnap) => {
@@ -49,13 +63,16 @@ export function subscribeTasks(onUpdate: (tasks: Task[]) => void, onError: (err:
           dropDeadDate: data.dropDeadDate || undefined,
           reasoning: data.reasoning || undefined,
           completed: !!data.completed,
+          completedAt: data.completedAt || undefined,
           isMustDo: data.isMustDo !== undefined && data.isMustDo !== null ? data.isMustDo : undefined,
           isNiceToDo: data.isNiceToDo !== undefined && data.isNiceToDo !== null ? data.isNiceToDo : undefined,
-          createdAt: data.createdAt || new Date().toISOString(),
+          isForceCritical: data.isForceCritical !== undefined && data.isForceCritical !== null ? data.isForceCritical : undefined,
+          createdAt: data.createdAt || "",
           tags: data.tags || []
         });
       });
-      onUpdate(tasksList);
+      tasksList.sort((a, b) => (b.createdAt || "").localeCompare(a.createdAt || ""));
+      onUpdate(tasksList, snapshot.metadata.fromCache);
     },
     (err) => {
       console.error("Firestore tasks subscription error:", err);
@@ -101,6 +118,7 @@ export async function saveTaskToDb(task: Task) {
       dropDeadDate: task.dropDeadDate || null,
       reasoning: task.reasoning || null,
       completed: task.completed,
+      completedAt: task.completedAt || null,
       isMustDo: task.isMustDo !== undefined ? task.isMustDo : null,
       isNiceToDo: task.isNiceToDo !== undefined ? task.isNiceToDo : null,
       isForceCritical: task.isForceCritical !== undefined ? task.isForceCritical : null,
@@ -109,91 +127,7 @@ export async function saveTaskToDb(task: Task) {
     }, { merge: true });
   } catch (error) {
     console.error("Error saving task to Firestore:", error);
-  }
-}
-
-/**
- * Explicitly pulls all documents from Firestore and merges with local data.
- * Guarantees no data loss when dev server resets or reloads.
- */
-export async function fetchAndSyncAllData(localTasks: Task[], localNorthStar: NorthStar): Promise<{ tasks: Task[]; northStar: NorthStar }> {
-  try {
-    const taskQuerySnap = await getDocs(collection(db, TASKS_COLL));
-    const remoteTasksList: Task[] = [];
-    taskQuerySnap.forEach((docSnap) => {
-      const data = docSnap.data();
-      remoteTasksList.push({
-        id: docSnap.id,
-        title: data.title || "",
-        priority: data.priority || "medium",
-        horizon: data.horizon || "today",
-        category: data.category || "general",
-        dropDeadDate: data.dropDeadDate || undefined,
-        reasoning: data.reasoning || undefined,
-        completed: !!data.completed,
-        isMustDo: data.isMustDo !== undefined && data.isMustDo !== null ? data.isMustDo : undefined,
-        isNiceToDo: data.isNiceToDo !== undefined && data.isNiceToDo !== null ? data.isNiceToDo : undefined,
-        isForceCritical: data.isForceCritical !== undefined && data.isForceCritical !== null ? data.isForceCritical : undefined,
-        createdAt: data.createdAt || new Date().toISOString(),
-        tags: data.tags || []
-      });
-    });
-
-    // Merge local and remote tasks by task ID
-    const taskMap = new Map<string, Task>();
-    localTasks.forEach((t) => {
-      if (t && t.id) taskMap.set(t.id, t);
-    });
-    remoteTasksList.forEach((rt) => {
-      if (rt && rt.id) taskMap.set(rt.id, rt);
-    });
-
-    const mergedTasks = Array.from(taskMap.values());
-
-    // Sync all back to Firestore in batches
-    if (mergedTasks.length > 0) {
-      const batch = writeBatch(db);
-      mergedTasks.forEach((t) => {
-        const docRef = doc(db, TASKS_COLL, t.id);
-        batch.set(docRef, {
-          title: t.title,
-          priority: t.priority,
-          horizon: t.horizon,
-          category: t.category,
-          dropDeadDate: t.dropDeadDate || null,
-          reasoning: t.reasoning || null,
-          completed: t.completed,
-          isMustDo: t.isMustDo !== undefined ? t.isMustDo : null,
-          isNiceToDo: t.isNiceToDo !== undefined ? t.isNiceToDo : null,
-          isForceCritical: t.isForceCritical !== undefined ? t.isForceCritical : null,
-          createdAt: t.createdAt,
-          tags: t.tags || []
-        }, { merge: true });
-      });
-      await batch.commit();
-    }
-
-    // Check North Star from Firestore
-    let ns = localNorthStar;
-    const nsSnap = await doc(db, SETTINGS_COLL, NORTH_STAR_DOC);
-    const nsGet = await getDocs(collection(db, SETTINGS_COLL));
-    nsGet.forEach((d) => {
-      if (d.id === NORTH_STAR_DOC) {
-        const data = d.data();
-        if (data && (data.title || data.description)) {
-          ns = {
-            title: data.title || "",
-            description: data.description || "",
-            history: data.history || []
-          };
-        }
-      }
-    });
-
-    return { tasks: mergedTasks, northStar: ns };
-  } catch (error) {
-    console.error("Error in fetchAndSyncAllData:", error);
-    return { tasks: localTasks, northStar: localNorthStar };
+    throw error;
   }
 }
 
@@ -206,6 +140,7 @@ export async function deleteTaskFromDb(taskId: string) {
     await deleteDoc(taskDocRef);
   } catch (error) {
     console.error("Error deleting task from Firestore:", error);
+    throw error;
   }
 }
 
@@ -222,6 +157,7 @@ export async function saveNorthStarToDb(ns: NorthStar) {
     });
   } catch (error) {
     console.error("Error saving North Star to Firestore:", error);
+    throw error;
   }
 }
 
@@ -229,7 +165,10 @@ export async function saveNorthStarToDb(ns: NorthStar) {
  * Syncs the Email Filters (ignored senders, domains, and specific emails) in real-time from Firestore.
  */
 export function subscribeEmailFilters(
-  onUpdate: (filters: { ignoredSenders: string[]; ignoredDomains: string[]; ignoredEmails: string[] }) => void,
+  onUpdate: (
+    filters: { ignoredSenders: string[]; ignoredDomains: string[]; ignoredEmails: string[] },
+    exists: boolean
+  ) => void,
   onError: (err: any) => void
 ) {
   return onSnapshot(
@@ -241,9 +180,11 @@ export function subscribeEmailFilters(
           ignoredSenders: data.ignoredSenders || [],
           ignoredDomains: data.ignoredDomains || [],
           ignoredEmails: data.ignoredEmails || []
-        });
+        }, true);
       } else {
-        onUpdate({ ignoredSenders: [], ignoredDomains: [], ignoredEmails: [] });
+        // Doc missing: report it without pretending the lists are empty, so the
+        // caller can migrate any locally-stored filters up instead of wiping them.
+        onUpdate({ ignoredSenders: [], ignoredDomains: [], ignoredEmails: [] }, false);
       }
     },
     (err) => {
@@ -254,19 +195,72 @@ export function subscribeEmailFilters(
 }
 
 /**
- * Saves or updates Email Filters in Firestore.
+ * Full replacement of the Email Filters doc. Only for one-time migration of
+ * locally-stored filters; interactive mutations must use the atomic
+ * add/remove helpers below so concurrent devices never clobber each other.
  */
 export async function saveEmailFiltersToDb(filters: { ignoredSenders: string[]; ignoredDomains: string[]; ignoredEmails: string[] }) {
   try {
-    const filtersDocRef = doc(db, SETTINGS_COLL, "email_filters");
-    await setDoc(filtersDocRef, {
-      ignoredSenders: filters.ignoredSenders,
-      ignoredDomains: filters.ignoredDomains,
-      ignoredEmails: filters.ignoredEmails
-    });
+    const payload: Record<string, any> = {};
+    if (filters.ignoredSenders.length) payload.ignoredSenders = arrayUnion(...filters.ignoredSenders);
+    if (filters.ignoredDomains.length) payload.ignoredDomains = arrayUnion(...filters.ignoredDomains);
+    if (filters.ignoredEmails.length) payload.ignoredEmails = arrayUnion(...filters.ignoredEmails);
+    if (Object.keys(payload).length === 0) return;
+    await setDoc(doc(db, SETTINGS_COLL, "email_filters"), payload, { merge: true });
   } catch (error) {
     console.error("Error saving Email Filters to Firestore:", error);
+    throw error;
   }
+}
+
+/**
+ * Atomically adds ignore-filter entries (safe under concurrent writers).
+ */
+export async function addEmailFilterEntries(entries: { senders?: string[]; domains?: string[]; emails?: string[] }) {
+  const payload: Record<string, any> = {};
+  if (entries.senders && entries.senders.length) payload.ignoredSenders = arrayUnion(...entries.senders);
+  if (entries.domains && entries.domains.length) payload.ignoredDomains = arrayUnion(...entries.domains);
+  if (entries.emails && entries.emails.length) payload.ignoredEmails = arrayUnion(...entries.emails);
+  if (Object.keys(payload).length === 0) return;
+  await setDoc(doc(db, SETTINGS_COLL, "email_filters"), payload, { merge: true });
+}
+
+/**
+ * Atomically removes ignore-filter entries (safe under concurrent writers).
+ */
+export async function removeEmailFilterEntries(entries: { senders?: string[]; domains?: string[]; emails?: string[] }) {
+  const payload: Record<string, any> = {};
+  if (entries.senders && entries.senders.length) payload.ignoredSenders = arrayRemove(...entries.senders);
+  if (entries.domains && entries.domains.length) payload.ignoredDomains = arrayRemove(...entries.domains);
+  if (entries.emails && entries.emails.length) payload.ignoredEmails = arrayRemove(...entries.emails);
+  if (Object.keys(payload).length === 0) return;
+  await setDoc(doc(db, SETTINGS_COLL, "email_filters"), payload, { merge: true });
+}
+
+/**
+ * Syncs Morning Briefing settings (auto-send toggle + last-sent date) so a
+ * briefing sent from one device is not re-sent by another the same day.
+ */
+export function subscribeBriefingSettings(
+  onUpdate: (settings: { autoSend?: boolean; lastSentDate?: string }) => void,
+  onError: (err: any) => void
+) {
+  return onSnapshot(
+    doc(db, SETTINGS_COLL, "briefing"),
+    (docSnap) => {
+      if (docSnap.exists()) {
+        onUpdate(docSnap.data() as { autoSend?: boolean; lastSentDate?: string });
+      }
+    },
+    (err) => {
+      console.error("Firestore Briefing settings subscription error:", err);
+      onError(err);
+    }
+  );
+}
+
+export async function saveBriefingSettingsToDb(settings: { autoSend?: boolean; lastSentDate?: string }) {
+  await setDoc(doc(db, SETTINGS_COLL, "briefing"), settings, { merge: true });
 }
 
 /**
@@ -295,11 +289,16 @@ export async function seedInitialTasksIfEmpty(initialTasks: Task[], initialNorth
       await batch.commit();
     }
 
-    const nsSnap = await doc(db, SETTINGS_COLL, NORTH_STAR_DOC);
-    const nsDoc = await setDoc(nsSnap, {
-      title: initialNorthStar.title,
-      description: initialNorthStar.description
-    }, { merge: true });
+    // Only seed the North Star when the doc does not exist yet — this used to
+    // run unconditionally and blanked the user's North Star on every app load.
+    const nsRef = doc(db, SETTINGS_COLL, NORTH_STAR_DOC);
+    const nsSnap = await getDoc(nsRef);
+    if (!nsSnap.exists()) {
+      await setDoc(nsRef, {
+        title: initialNorthStar.title,
+        description: initialNorthStar.description
+      }, { merge: true });
+    }
 
   } catch (error) {
     console.error("Error seeding initial data to Firestore:", error);
@@ -377,8 +376,29 @@ const provider = new GoogleAuthProvider();
 provider.addScope("https://www.googleapis.com/auth/gmail.readonly");
 provider.addScope("https://www.googleapis.com/auth/gmail.send");
 
+// Google OAuth access tokens live ~1 hour. Store an expiry alongside each
+// cached token so a stale token is never restored as a "valid" session.
+const TOKEN_TTL_MS = 55 * 60 * 1000;
+
+export const storeGoogleToken = (key: string, token: string): void => {
+  safeSessionStorage.setItem(key, token);
+  safeSessionStorage.setItem(`${key}_expiry`, String(Date.now() + TOKEN_TTL_MS));
+};
+
+export const readStoredGoogleToken = (key: string): string | null => {
+  const token = safeSessionStorage.getItem(key);
+  if (!token) return null;
+  const expiry = Number(safeSessionStorage.getItem(`${key}_expiry`) || 0);
+  if (!expiry || Date.now() >= expiry) {
+    safeSessionStorage.removeItem(key);
+    safeSessionStorage.removeItem(`${key}_expiry`);
+    return null;
+  }
+  return token;
+};
+
 let isSigningIn = false;
-let cachedAccessToken: string | null = safeSessionStorage.getItem("google_access_token");
+let cachedAccessToken: string | null = readStoredGoogleToken("google_access_token");
 
 export const initAuth = (
   onAuthSuccess?: (user: User, token: string) => void,
@@ -409,7 +429,7 @@ export const googleSignIn = async (): Promise<{ user: User; accessToken: string 
     }
 
     cachedAccessToken = credential.accessToken;
-    safeSessionStorage.setItem("google_access_token", cachedAccessToken);
+    storeGoogleToken("google_access_token", cachedAccessToken);
     return { user: result.user, accessToken: cachedAccessToken };
   } catch (error: any) {
     console.error("Sign in error:", error);
@@ -433,7 +453,7 @@ export const checkRedirectResult = async (): Promise<{ user: User; accessToken: 
         throw new Error("Failed to get access token from Google redirect result");
       }
       cachedAccessToken = credential.accessToken;
-      safeSessionStorage.setItem("google_access_token", cachedAccessToken);
+      storeGoogleToken("google_access_token", cachedAccessToken);
       return { user: result.user, accessToken: cachedAccessToken };
     }
     return null;
@@ -452,7 +472,7 @@ export const signInWithGoogleToken = async (accessToken: string): Promise<User> 
     const credential = GoogleAuthProvider.credential(null, accessToken);
     const result = await signInWithCredential(auth, credential);
     cachedAccessToken = accessToken;
-    safeSessionStorage.setItem("google_access_token", accessToken);
+    storeGoogleToken("google_access_token", accessToken);
     return result.user;
   } catch (error) {
     console.error("signInWithGoogleToken failed:", error);
@@ -464,6 +484,8 @@ export const logout = async () => {
   await signOut(auth);
   cachedAccessToken = null;
   safeSessionStorage.removeItem("google_access_token");
+  safeSessionStorage.removeItem("google_access_token_expiry");
   safeSessionStorage.removeItem("gis_access_token");
+  safeSessionStorage.removeItem("gis_access_token_expiry");
   safeSessionStorage.removeItem("gis_user");
 };

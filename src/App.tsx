@@ -130,6 +130,17 @@ const detectTags = (title: string): string[] => {
   return tags;
 };
 
+// Parse the address / domain out of a raw RFC "From" header value
+const extractEmailAddress = (fromStr: string): string => {
+  const match = (fromStr || "").match(/<([^>]+)>/) || [null, fromStr];
+  return ((match[1] || fromStr) || "").trim().toLowerCase();
+};
+
+const extractEmailDomain = (address: string): string => {
+  const parts = address.split("@");
+  return parts[parts.length - 1]?.trim().toLowerCase() || "";
+};
+
 const calculateStringSimilarity = (s1: string, s2: string): number => {
   const clean1 = s1.trim().toLowerCase();
   const clean2 = s2.trim().toLowerCase();
@@ -209,27 +220,36 @@ export default function App() {
   });
   const [showMutedSettings, setShowMutedSettings] = useState(false);
 
+  // Latest ignore lists for callbacks whose closures may be stale (e.g. the
+  // triage fetch fired from the mount-time auth effect).
+  const emailFiltersRef = useRef({ ignoredSenders, ignoredDomains, ignoredEmails });
+  useEffect(() => {
+    emailFiltersRef.current = { ignoredSenders, ignoredDomains, ignoredEmails };
+  }, [ignoredSenders, ignoredDomains, ignoredEmails]);
+
+  // Mirror ignore lists to this device's localStorage whenever they change
+  useEffect(() => {
+    safeLocalStorage.setItem("ignored_senders", JSON.stringify(ignoredSenders));
+  }, [ignoredSenders]);
+  useEffect(() => {
+    safeLocalStorage.setItem("ignored_domains", JSON.stringify(ignoredDomains));
+  }, [ignoredDomains]);
+  useEffect(() => {
+    safeLocalStorage.setItem("ignored_emails", JSON.stringify(ignoredEmails));
+  }, [ignoredEmails]);
+
   // --- Persistent State ---
   const [tasks, setTasks] = useState<Task[]>(() => {
     const saved = safeLocalStorage.getItem("brain_dump_tasks");
-    const backup = safeLocalStorage.getItem("brain_dump_tasks_backup");
-    if (saved) {
-      try {
-        const parsed = JSON.parse(saved);
-        if (Array.isArray(parsed) && parsed.length > 0) return parsed;
-      } catch (e) {}
-    }
-    if (backup) {
-      try {
-        const parsed = JSON.parse(backup);
-        if (Array.isArray(parsed) && parsed.length > 0) return parsed;
-      } catch (e) {}
-    }
-    return INITIAL_TASKS;
+    return saved ? JSON.parse(saved) : INITIAL_TASKS;
   });
 
-  const [isReSyncing, setIsReSyncing] = useState(false);
-  const [reSyncToast, setReSyncToast] = useState<string | null>(null);
+  // Latest tasks for async callbacks (coach review, etc.) that would otherwise
+  // operate on the stale list captured before their awaits
+  const tasksRef = useRef<Task[]>(tasks);
+  useEffect(() => {
+    tasksRef.current = tasks;
+  }, [tasks]);
 
   const [northStar, setNorthStar] = useState<NorthStar>(() => {
     const saved = safeLocalStorage.getItem("brain_dump_north_star");
@@ -244,7 +264,6 @@ export default function App() {
       setTasks([]);
       setNorthStar({ title: "", description: "" });
       safeLocalStorage.removeItem("brain_dump_tasks");
-      safeLocalStorage.removeItem("brain_dump_tasks_backup");
       safeLocalStorage.removeItem("brain_dump_north_star");
       
       if (dbStatus === "synced" || dbStatus === "connecting") {
@@ -254,47 +273,6 @@ export default function App() {
       setShowResetConfirm(false);
     } catch (e) {
       console.error("Error resetting all data:", e);
-    }
-  };
-
-  const handleReSyncAllData = async () => {
-    setIsReSyncing(true);
-    try {
-      const { fetchAndSyncAllData } = await import("./lib/firebase");
-      let currentLocal = tasks;
-      if (currentLocal.length === 0) {
-        const backup = safeLocalStorage.getItem("brain_dump_tasks_backup");
-        if (backup) {
-          try {
-            const parsed = JSON.parse(backup);
-            if (Array.isArray(parsed) && parsed.length > 0) {
-              currentLocal = parsed;
-            }
-          } catch (e) {}
-        }
-      }
-      const { tasks: syncedTasks, northStar: syncedNS } = await fetchAndSyncAllData(currentLocal, northStar);
-      
-      setTasks(syncedTasks);
-      safeLocalStorage.setItem("brain_dump_tasks", JSON.stringify(syncedTasks));
-      if (syncedTasks.length > 0) {
-        safeLocalStorage.setItem("brain_dump_tasks_backup", JSON.stringify(syncedTasks));
-      }
-
-      if (syncedNS && (syncedNS.title || syncedNS.description)) {
-        setNorthStar(syncedNS);
-        safeLocalStorage.setItem("brain_dump_north_star", JSON.stringify(syncedNS));
-      }
-
-      setDbStatus("synced");
-      setReSyncToast(`Data re-synced! ${syncedTasks.length} task${syncedTasks.length === 1 ? "" : "s"} active & restored.`);
-      setTimeout(() => setReSyncToast(null), 4500);
-    } catch (err: any) {
-      console.error("Re-sync error:", err);
-      setReSyncToast("Sync completed with local state.");
-      setTimeout(() => setReSyncToast(null), 3000);
-    } finally {
-      setIsReSyncing(false);
     }
   };
 
@@ -309,58 +287,64 @@ export default function App() {
     }
   }, [dbStatus]);
 
+  // One-time guards for migrating pre-Firestore local data up to the cloud.
+  // "has_synced_with_firestore" marks that this device's localStorage is just a
+  // mirror of Firestore — after that, local-only tasks are never re-uploaded
+  // (re-uploading them is how deleted tasks used to resurrect across devices).
+  const hasEverSyncedRef = useRef(safeLocalStorage.getItem("has_synced_with_firestore") === "true");
+  const localTasksMigratedRef = useRef(false);
+  const localFiltersMigratedRef = useRef(false);
+
   useEffect(() => {
     let unsubscribeTasks: (() => void) | null = null;
     let unsubscribeNorthStar: (() => void) | null = null;
     let unsubscribeEmailFilters: (() => void) | null = null;
+    let unsubscribeBriefing: (() => void) | null = null;
 
     async function initFirebase() {
       try {
-        const { seedInitialTasksIfEmpty, subscribeTasks, subscribeNorthStar, subscribeEmailFilters } = await import("./lib/firebase");
+        const { seedInitialTasksIfEmpty, subscribeTasks, subscribeNorthStar, subscribeEmailFilters, subscribeBriefingSettings } = await import("./lib/firebase");
 
         // Seed initial tasks if empty on firestore in background (non-blocking)
         seedInitialTasksIfEmpty(INITIAL_TASKS, INITIAL_NORTH_STAR).catch((err) => {
           console.error("Firebase subscription seeding error:", err);
         });
 
-        // Subscribe to remote tasks
+        // Subscribe to remote tasks. Firestore (with its offline persistence)
+        // is the source of truth: snapshots REPLACE local state. The old
+        // union-merge re-uploaded anything left in another device's
+        // localStorage, which resurrected deleted tasks. The only exception is
+        // a one-time migration of pre-existing local tasks into an empty DB.
         unsubscribeTasks = subscribeTasks(
-          (remoteTasks) => {
-            if (remoteTasks && remoteTasks.length > 0) {
-              setTasks((prev) => {
-                const remoteIds = new Set(remoteTasks.map((rt) => rt.id));
-                const localOnly = prev.filter((lt) => !remoteIds.has(lt.id));
-                // Automatically upload any unsynced local tasks to Firestore
-                if (localOnly.length > 0) {
-                  import("./lib/firebase").then(({ saveTaskToDb }) => {
-                    localOnly.forEach((lt) => saveTaskToDb(lt));
-                  });
-                }
-                return [...remoteTasks, ...localOnly];
-              });
-            } else if (remoteTasks && remoteTasks.length === 0) {
-              setTasks((prev) => {
-                let tasksToUse = prev;
-                if (tasksToUse.length === 0) {
-                  const backup = safeLocalStorage.getItem("brain_dump_tasks_backup");
-                  if (backup) {
-                    try {
-                      const parsed = JSON.parse(backup);
-                      if (Array.isArray(parsed) && parsed.length > 0) {
-                        tasksToUse = parsed;
-                      }
-                    } catch (e) {}
-                  }
-                }
-                if (tasksToUse.length > 0) {
-                  import("./lib/firebase").then(({ saveTaskToDb }) => {
-                    tasksToUse.forEach((t) => saveTaskToDb(t));
-                  });
-                }
-                return tasksToUse;
-              });
+          (remoteTasks, fromCache) => {
+            const localTasks = tasksRef.current;
+            const isLegacyLocalOnlyData =
+              !hasEverSyncedRef.current && remoteTasks.length === 0 && localTasks.length > 0;
+
+            if (isLegacyLocalOnlyData) {
+              // This device has pre-Firestore tasks and the remote DB is empty:
+              // keep the local list and (once the server confirms the DB really
+              // is empty) migrate it up. Never wipe it with an empty snapshot.
+              if (!fromCache && !localTasksMigratedRef.current) {
+                localTasksMigratedRef.current = true;
+                import("./lib/firebase").then(({ saveTaskToDb }) => {
+                  localTasks.forEach((t) =>
+                    saveTaskToDb(t).catch((e) => {
+                      console.error("Error migrating local task to Firestore:", e);
+                      setDbStatus("error");
+                    })
+                  );
+                });
+              }
+            } else {
+              setTasks(remoteTasks);
             }
-            setDbStatus("synced");
+
+            if (!fromCache) {
+              hasEverSyncedRef.current = true;
+              safeLocalStorage.setItem("has_synced_with_firestore", "true");
+              setDbStatus("synced");
+            }
           },
           (err) => {
             console.error("Firebase subscription tasks error:", err);
@@ -383,18 +367,49 @@ export default function App() {
         // Subscribe to remote Email Filters (ignored senders, domains & specific emails)
         if (typeof subscribeEmailFilters === "function") {
           unsubscribeEmailFilters = subscribeEmailFilters(
-            (filters) => {
-              if (filters) {
+            (filters, exists) => {
+              if (exists) {
                 setIgnoredSenders(filters.ignoredSenders || []);
                 setIgnoredDomains(filters.ignoredDomains || []);
                 setIgnoredEmails(filters.ignoredEmails || []);
-                safeLocalStorage.setItem("ignored_senders", JSON.stringify(filters.ignoredSenders || []));
-                safeLocalStorage.setItem("ignored_domains", JSON.stringify(filters.ignoredDomains || []));
-                safeLocalStorage.setItem("ignored_emails", JSON.stringify(filters.ignoredEmails || []));
+              } else if (!localFiltersMigratedRef.current) {
+                // No remote doc yet: push this device's locally-stored filters
+                // up instead of wiping them.
+                localFiltersMigratedRef.current = true;
+                const local = emailFiltersRef.current;
+                if (local.ignoredSenders.length || local.ignoredDomains.length || local.ignoredEmails.length) {
+                  import("./lib/firebase").then(({ saveEmailFiltersToDb }) => {
+                    saveEmailFiltersToDb(local).catch((err) => {
+                      console.error("Failed to migrate local email filters to Firestore:", err);
+                    });
+                  });
+                }
               }
             },
             (err) => {
               console.error("Firebase subscription Email Filters error:", err);
+            }
+          );
+        }
+
+        // Subscribe to shared Morning Briefing settings so one device's send
+        // suppresses auto-sends from the others.
+        if (typeof subscribeBriefingSettings === "function") {
+          unsubscribeBriefing = subscribeBriefingSettings(
+            (settings) => {
+              if (typeof settings.autoSend === "boolean") {
+                setAutoSendDailySummary(settings.autoSend);
+                safeLocalStorage.setItem("auto_send_daily_summary", settings.autoSend ? "true" : "false");
+              }
+              if (settings.lastSentDate) {
+                setLastSentDailySummaryDate((prev) =>
+                  prev && prev >= settings.lastSentDate! ? prev : settings.lastSentDate!
+                );
+                safeLocalStorage.setItem("last_sent_daily_summary_date", settings.lastSentDate);
+              }
+            },
+            (err) => {
+              console.error("Firebase subscription Briefing settings error:", err);
             }
           );
         }
@@ -410,6 +425,7 @@ export default function App() {
       if (unsubscribeTasks) unsubscribeTasks();
       if (unsubscribeNorthStar) unsubscribeNorthStar();
       if (unsubscribeEmailFilters) unsubscribeEmailFilters();
+      if (unsubscribeBriefing) unsubscribeBriefing();
     };
   }, []);
 
@@ -418,9 +434,21 @@ export default function App() {
     let unsubscribeAuth: (() => void) | null = null;
     
     async function setupAuth() {
-      // 1. Try Direct Google Identity Services (GIS) first if stored in session
-      const storedGisToken = safeSessionStorage.getItem("gis_access_token");
+      // 1. Try Direct Google Identity Services (GIS) first if stored in session.
+      // readStoredGoogleToken discards tokens past their ~1h lifetime, so an
+      // expired session falls through to a fresh sign-in instead of restoring
+      // a token every Gmail call would reject.
+      let storedGisToken: string | null = null;
+      try {
+        const { readStoredGoogleToken } = await import("./lib/firebase");
+        storedGisToken = readStoredGoogleToken("gis_access_token");
+      } catch (e) {
+        console.error("Failed to load token helper:", e);
+      }
       const storedGisUser = safeSessionStorage.getItem("gis_user");
+      if (!storedGisToken && storedGisUser) {
+        safeSessionStorage.removeItem("gis_user");
+      }
       if (storedGisToken && storedGisUser) {
         try {
           const parsedUser = JSON.parse(storedGisUser);
@@ -563,16 +591,16 @@ export default function App() {
             setAccessToken(token);
             setNeedsAuth(false);
             
-            // Persist session locally to avoid re-prompting on simple refreshes
-            safeSessionStorage.setItem("gis_access_token", token);
+            // Persist session locally (with expiry) to avoid re-prompting on simple refreshes
             safeSessionStorage.setItem("gis_user", JSON.stringify(constructedUser));
 
             // Fetch triaged emails
             fetchTriagedEmails(token);
 
-            // Link Firebase Auth in background to authenticate Firestore
+            // Store the token with its expiry and link Firebase Auth in background
             import("./lib/firebase")
-              .then(({ signInWithGoogleToken }) => {
+              .then(({ storeGoogleToken, signInWithGoogleToken }) => {
+                storeGoogleToken("gis_access_token", token);
                 signInWithGoogleToken(token).catch((err) => {
                   console.warn("Failed to background sign-in Firebase Auth with GIS token:", err);
                 });
@@ -704,7 +732,7 @@ export default function App() {
         body: JSON.stringify({
           tasks,
           northStar,
-          triagedEmails,
+          triagedEmails: visibleTriagedEmails,
           dashboardUrl: window.location.href,
           userEmail: googleUser?.email
         })
@@ -754,10 +782,14 @@ export default function App() {
 
       setBriefingSentSuccess(true);
       setBriefingCoachCommentary(data.coachCommentary || "");
-      
-      const todayStr = new Date().toISOString().split("T")[0];
-      setLastSentDailySummaryDate(todayStr);
-      safeLocalStorage.setItem("last_sent_daily_summary_date", todayStr);
+
+      const sentDateStr = new Date().toLocaleDateString("en-CA");
+      setLastSentDailySummaryDate(sentDateStr);
+      safeLocalStorage.setItem("last_sent_daily_summary_date", sentDateStr);
+      // Share the sent date so other devices don't auto-send a duplicate today
+      import("./lib/firebase")
+        .then(({ saveBriefingSettingsToDb }) => saveBriefingSettingsToDb({ lastSentDate: sentDateStr }))
+        .catch((e) => console.error("Failed to sync briefing sent date:", e));
     } catch (err: any) {
       console.error("Error sending Focus Briefing:", err);
       let errMsg = err.message || "Something went wrong while sending your focus briefing.";
@@ -778,13 +810,13 @@ export default function App() {
   // Auto-send daily summary email on first login/load of the day
   useEffect(() => {
     if (googleUser && accessToken && autoSendDailySummary) {
-      const todayStr = new Date().toISOString().split("T")[0];
-      if (lastSentDailySummaryDate !== todayStr && !isBriefingSending && !briefingSentSuccess) {
+      const currentDateStr = new Date().toLocaleDateString("en-CA");
+      if (lastSentDailySummaryDate !== currentDateStr && !isBriefingSending && !briefingSentSuccess) {
         console.log("Detecting new day. Auto-sending Morning Focus Briefing...");
         handleSendDailyBriefing();
       }
     }
-  }, [googleUser, accessToken, autoSendDailySummary, lastSentDailySummaryDate]);
+  }, [googleUser, accessToken, autoSendDailySummary, lastSentDailySummaryDate, isBriefingSending, briefingSentSuccess]);
 
   const fetchTriagedEmails = async (tokenStr = accessToken) => {
     const currentToken = tokenStr || accessToken;
@@ -805,9 +837,9 @@ export default function App() {
         },
         body: JSON.stringify({
           currentDate: new Date().toLocaleDateString("en-CA"), // Dynamically calculate current local date (YYYY-MM-DD)
-          ignoredSenders,
-          ignoredDomains,
-          ignoredEmails
+          // Read via ref: this function is often invoked from mount-time
+          // closures whose captured state predates the Firestore filter sync
+          ...emailFiltersRef.current
         })
       });
 
@@ -868,119 +900,62 @@ export default function App() {
     }
   };
 
+  // All ignore/mute mutations use functional state updates (never stale
+  // closures) and atomic arrayUnion/arrayRemove writes in Firestore, so
+  // concurrent actions across tabs/devices can never clobber each other.
+  // The visible triage list is derived via visibleTriagedEmails, so entries
+  // disappear instantly and stay hidden on every synced device.
   const handleIgnoreSpecificEmail = async (emailId: string) => {
     if (!emailId) return;
-    const updatedEmails = [...ignoredEmails];
-    if (!updatedEmails.includes(emailId)) {
-      updatedEmails.push(emailId);
-    }
-
-    setIgnoredEmails(updatedEmails);
-    safeLocalStorage.setItem("ignored_emails", JSON.stringify(updatedEmails));
+    setIgnoredEmails((prev) => (prev.includes(emailId) ? prev : [...prev, emailId]));
 
     try {
-      const { saveEmailFiltersToDb } = await import("./lib/firebase");
-      await saveEmailFiltersToDb({
-        ignoredSenders,
-        ignoredDomains,
-        ignoredEmails: updatedEmails
-      });
+      const { addEmailFilterEntries } = await import("./lib/firebase");
+      await addEmailFilterEntries({ emails: [emailId] });
     } catch (err) {
       console.error("Failed to save email filters to remote DB:", err);
     }
-
-    // Immediately filter the active triagedEmails state
-    setTriagedEmails((prev) => prev.filter((item: any) => item.id !== emailId && item.emailId !== emailId));
   };
 
   const handleRemoveIgnoreSpecificEmail = async (emailId: string) => {
-    const updatedEmails = ignoredEmails.filter((id) => id !== emailId);
-    setIgnoredEmails(updatedEmails);
-    safeLocalStorage.setItem("ignored_emails", JSON.stringify(updatedEmails));
+    setIgnoredEmails((prev) => prev.filter((id) => id !== emailId));
 
     try {
-      const { saveEmailFiltersToDb } = await import("./lib/firebase");
-      await saveEmailFiltersToDb({
-        ignoredSenders,
-        ignoredDomains,
-        ignoredEmails: updatedEmails
-      });
+      const { removeEmailFilterEntries } = await import("./lib/firebase");
+      await removeEmailFilterEntries({ emails: [emailId] });
     } catch (err) {
       console.error("Failed to save email filters to remote DB:", err);
     }
   };
 
   const handleIgnoreEmailSource = async (email: any, ignoreType: "sender" | "domain") => {
-    const fromStr = email.from || "";
-    const emailMatch = fromStr.match(/<([^>]+)>/) || [null, fromStr];
-    const emailAddress = (emailMatch[1] || fromStr).trim().toLowerCase();
-    const domainParts = emailAddress.split("@");
-    const domain = domainParts[domainParts.length - 1]?.trim().toLowerCase() || "";
-
-    let updatedSenders = [...ignoredSenders];
-    let updatedDomains = [...ignoredDomains];
-
-    if (ignoreType === "sender" && emailAddress) {
-      if (!updatedSenders.includes(emailAddress)) {
-        updatedSenders.push(emailAddress);
-      }
-    } else if (ignoreType === "domain" && domain) {
-      if (!updatedDomains.includes(domain)) {
-        updatedDomains.push(domain);
-      }
-    }
-
-    setIgnoredSenders(updatedSenders);
-    setIgnoredDomains(updatedDomains);
-    safeLocalStorage.setItem("ignored_senders", JSON.stringify(updatedSenders));
-    safeLocalStorage.setItem("ignored_domains", JSON.stringify(updatedDomains));
+    const emailAddress = extractEmailAddress(email.from || "");
+    const domain = extractEmailDomain(emailAddress);
 
     try {
-      const { saveEmailFiltersToDb } = await import("./lib/firebase");
-      await saveEmailFiltersToDb({
-        ignoredSenders: updatedSenders,
-        ignoredDomains: updatedDomains,
-        ignoredEmails
-      });
+      const { addEmailFilterEntries } = await import("./lib/firebase");
+      if (ignoreType === "sender" && emailAddress) {
+        setIgnoredSenders((prev) => (prev.includes(emailAddress) ? prev : [...prev, emailAddress]));
+        await addEmailFilterEntries({ senders: [emailAddress] });
+      } else if (ignoreType === "domain" && domain) {
+        setIgnoredDomains((prev) => (prev.includes(domain) ? prev : [...prev, domain]));
+        await addEmailFilterEntries({ domains: [domain] });
+      }
     } catch (err) {
       console.error("Failed to save email filters to remote DB:", err);
     }
-
-    // Immediately filter the active triagedEmails state
-    setTriagedEmails((prev) => prev.filter((item: any) => {
-      const itemMatch = item.from.match(/<([^>]+)>/) || [null, item.from];
-      const itemAddress = (itemMatch[1] || item.from).trim().toLowerCase();
-      const itemDomainParts = itemAddress.split("@");
-      const itemDomain = itemDomainParts[itemDomainParts.length - 1]?.trim().toLowerCase() || "";
-
-      if (updatedSenders.includes(itemAddress)) return false;
-      if (updatedDomains.some((d: string) => itemDomain === d || itemDomain.endsWith("." + d))) return false;
-      return true;
-    }));
   };
 
   const handleRemoveIgnoreRule = async (value: string, ignoreType: "sender" | "domain") => {
-    let updatedSenders = [...ignoredSenders];
-    let updatedDomains = [...ignoredDomains];
-
-    if (ignoreType === "sender") {
-      updatedSenders = updatedSenders.filter((s) => s !== value);
-    } else if (ignoreType === "domain") {
-      updatedDomains = updatedDomains.filter((d) => d !== value);
-    }
-
-    setIgnoredSenders(updatedSenders);
-    setIgnoredDomains(updatedDomains);
-    safeLocalStorage.setItem("ignored_senders", JSON.stringify(updatedSenders));
-    safeLocalStorage.setItem("ignored_domains", JSON.stringify(updatedDomains));
-
     try {
-      const { saveEmailFiltersToDb } = await import("./lib/firebase");
-      await saveEmailFiltersToDb({
-        ignoredSenders: updatedSenders,
-        ignoredDomains: updatedDomains,
-        ignoredEmails
-      });
+      const { removeEmailFilterEntries } = await import("./lib/firebase");
+      if (ignoreType === "sender") {
+        setIgnoredSenders((prev) => prev.filter((s) => s !== value));
+        await removeEmailFilterEntries({ senders: [value] });
+      } else if (ignoreType === "domain") {
+        setIgnoredDomains((prev) => prev.filter((d) => d !== value));
+        await removeEmailFilterEntries({ domains: [value] });
+      }
     } catch (err) {
       console.error("Failed to save email filters to remote DB:", err);
     }
@@ -1133,6 +1108,7 @@ export default function App() {
       .then(({ saveTaskToDb }) => {
         saveTaskToDb(task).catch((e) => {
           console.error("Error saving task to Firestore in background:", e);
+          setDbStatus("error");
         });
       })
       .catch((e) => {
@@ -1170,46 +1146,11 @@ export default function App() {
   };
 
   const handleToggleForceCritical = async (taskId: string, currentIsForceCritical?: boolean) => {
-    const targetTask = tasks.find((t) => t.id === taskId);
-    const isCurrentlyCritical =
-      !!currentIsForceCritical ||
-      !!targetTask?.isForceCritical ||
-      (!!targetTask?.dropDeadDate && targetTask.dropDeadDate.trim() !== "" && getCriticalStatus(targetTask) !== null);
-
-    const updatedTasks = tasks.map((t) => {
-      if (t.id === taskId) {
-        if (isCurrentlyCritical) {
-          // Unflag critical: remove force critical AND clear drop-dead date so it instantly leaves Critical Items
-          return {
-            ...t,
-            isForceCritical: false,
-            dropDeadDate: undefined
-          };
-        } else {
-          // Flag as critical item
-          return {
-            ...t,
-            isForceCritical: true
-          };
-        }
-      }
-      return t;
-    });
-
-    setTasks(updatedTasks);
-
-    const updatedTask = updatedTasks.find((t) => t.id === taskId);
-    if (updatedTask) {
-      await saveTask(updatedTask);
-    }
-  };
-
-  const handleQuickUpdateDate = async (taskId: string, newDateStr: string) => {
     const updatedTasks = tasks.map((t) => {
       if (t.id === taskId) {
         return {
           ...t,
-          dropDeadDate: newDateStr.trim() ? newDateStr.trim() : undefined
+          isForceCritical: !currentIsForceCritical
         };
       }
       return t;
@@ -1250,6 +1191,7 @@ export default function App() {
       .then(({ deleteTaskFromDb }) => {
         deleteTaskFromDb(taskId).catch((e) => {
           console.error("Error deleting task from Firestore in background:", e);
+          setDbStatus("error");
         });
       })
       .catch((e) => {
@@ -1273,9 +1215,6 @@ export default function App() {
 
   useEffect(() => {
     safeLocalStorage.setItem("brain_dump_tasks", JSON.stringify(tasks));
-    if (tasks.length > 0) {
-      safeLocalStorage.setItem("brain_dump_tasks_backup", JSON.stringify(tasks));
-    }
   }, [tasks]);
 
   useEffect(() => {
@@ -1344,8 +1283,11 @@ export default function App() {
   const [editPriorityInput, setEditPriorityInput] = useState<Task["priority"]>("medium");
 
   // --- Helper Date Calculations ---
-  const todayStr = new Date().toISOString().split("T")[0] || "2026-07-23";
-  const todayDateObj = new Date(todayStr);
+  // Always derive "today" from the real clock — this was previously frozen at
+  // a hardcoded date, which silently broke every deadline countdown and all
+  // relative-date parsing ("by Friday") from that day onward.
+  const todayDateObj = new Date();
+  const todayStr = todayDateObj.toLocaleDateString("en-CA");
 
   const getCriticalStatus = (task: Task) => {
     if (task.isForceCritical) {
@@ -1360,12 +1302,11 @@ export default function App() {
       };
     }
     if (!task.dropDeadDate) return null;
-    const dateParts = task.dropDeadDate.split("T")[0].split("-").map(Number);
-    if (dateParts.length < 3 || isNaN(dateParts[0])) return null;
-    const taskMidnight = new Date(dateParts[0], dateParts[1] - 1, dateParts[2]);
+    const taskDate = new Date(task.dropDeadDate);
     const currentMidnight = new Date(todayDateObj.getFullYear(), todayDateObj.getMonth(), todayDateObj.getDate());
+    const taskMidnight = new Date(taskDate.getFullYear(), taskDate.getMonth(), taskDate.getDate());
     const diffTime = taskMidnight.getTime() - currentMidnight.getTime();
-    const diffDays = Math.round(diffTime / (1000 * 60 * 60 * 24));
+    const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
 
     if (diffDays <= 5) {
       return {
@@ -1391,12 +1332,9 @@ export default function App() {
 
   const getDeadlineBadgeStyle = (dateStr?: string) => {
     if (!dateStr) return null;
-    const dateParts = dateStr.split("T")[0].split("-").map(Number);
-    if (dateParts.length < 3 || isNaN(dateParts[0])) return null;
-    const taskMidnight = new Date(dateParts[0], dateParts[1] - 1, dateParts[2]);
-    const currentMidnight = new Date(todayDateObj.getFullYear(), todayDateObj.getMonth(), todayDateObj.getDate());
-    const diffTime = taskMidnight.getTime() - currentMidnight.getTime();
-    const diffDays = Math.round(diffTime / (1000 * 60 * 60 * 24));
+    const taskDate = new Date(dateStr);
+    const diffTime = taskDate.getTime() - todayDateObj.getTime();
+    const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
 
     if (diffDays < 0) {
       return { text: `Overdue by ${Math.abs(diffDays)}d`, color: "bg-red-100 text-red-800 border-red-300 font-semibold" };
@@ -1419,69 +1357,56 @@ export default function App() {
     setIsAnalyzing(true);
     setAnalysisError(null);
 
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 12000); // 12-second max timeout
-
     try {
-      let data: any = null;
-      try {
-        const response = await fetch("/api/organize-dump", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            dumpText: textToAnalyze,
-            currentDate: todayStr,
-            northStar: `${northStar.title}: ${northStar.description}`
-          }),
-          signal: controller.signal
-        });
+      const response = await fetch("/api/organize-dump", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          dumpText: textToAnalyze,
+          currentDate: todayStr,
+          northStar: `${northStar.title}: ${northStar.description}`
+        })
+      });
 
-        clearTimeout(timeoutId);
-
-        if (response.ok) {
-          const text = await response.text();
-          if (text && text.trim() !== "") {
-            data = JSON.parse(text);
-          }
+      if (!response.ok) {
+        const text = await response.text().catch(() => "");
+        let errorMsg = "Failed to process brain dump. Please ensure API key is active.";
+        try {
+          const errData = JSON.parse(text);
+          errorMsg = errData.error || errorMsg;
+        } catch (_) {
+          errorMsg = text || errorMsg;
         }
-      } catch (fetchErr) {
-        console.warn("API organize-dump call timed out or failed, utilizing fast fallback parser.", fetchErr);
+        throw new Error(errorMsg);
       }
 
-      clearTimeout(timeoutId);
-
-      // Fallback if API response wasn't received or parsed
-      if (!data || !data.items || !Array.isArray(data.items)) {
-        const lines = textToAnalyze.split(/\n+/).map((l) => l.replace(/^[-*•\d.\s]+/, "").trim()).filter((l) => l.length > 0);
-        data = {
-          items: lines.map((line) => ({
-            title: line,
-            priority: "medium",
-            horizon: "this_week",
-            category: "general",
-            dropDeadDate: null,
-            reasoning: "Extracted directly from brain dump."
-          }))
-        };
+      const text = await response.text();
+      if (!text || text.trim() === "") {
+        throw new Error("Server returned an empty response. Please try again.");
       }
 
+      let data;
+      try {
+        data = JSON.parse(text);
+      } catch (_) {
+        if (text.toLowerCase().includes("upstream")) {
+          throw new Error("The server is temporarily busy or connection timed out. Please try again in a moment.");
+        }
+        throw new Error("Received an invalid response format from the server.");
+      }
       if (data.items && Array.isArray(data.items)) {
-        const generatedTasks: Task[] = data.items.map((item: any, idx: number) => {
-          const rawDateStr = (item.dropDeadDate && typeof item.dropDeadDate === "string" && item.dropDeadDate !== "null" && item.dropDeadDate !== "undefined" && item.dropDeadDate.trim() !== "") ? item.dropDeadDate.trim() : undefined;
-          const cleanDate = rawDateStr ? rawDateStr.split("T")[0] : undefined;
-          return {
-            id: `task-gemini-${Date.now()}-${idx}`,
-            title: item.title || textToAnalyze.trim(),
-            priority: item.priority || "medium",
-            horizon: item.horizon || "this_week",
-            category: item.category || "general",
-            dropDeadDate: cleanDate,
-            reasoning: item.reasoning,
-            completed: false,
-            createdAt: new Date().toISOString(),
-            tags: item.tags || detectTags(item.title || "")
-          };
-        });
+        const generatedTasks: Task[] = data.items.map((item: any, idx: number) => ({
+          id: `task-gemini-${Date.now()}-${idx}`,
+          title: item.title,
+          priority: item.priority || "medium",
+          horizon: item.horizon || "backlog",
+          category: item.category || "general",
+          dropDeadDate: item.dropDeadDate || undefined,
+          reasoning: item.reasoning,
+          completed: false,
+          createdAt: new Date().toISOString(),
+          tags: item.tags || detectTags(item.title)
+        }));
 
         const toSaveImmediately: Task[] = [];
         const duplicatesFound: any[] = [];
@@ -1517,10 +1442,17 @@ export default function App() {
       }
     } catch (err: any) {
       console.error(err);
-      let errMsg = err.message || "Something went wrong processing your brain dump.";
+      let errMsg = err.message || "Something went wrong communicating with the coach.";
+      try {
+        const parsed = JSON.parse(errMsg);
+        if (parsed.error && parsed.error.message) {
+          errMsg = parsed.error.message;
+        } else if (parsed.message) {
+          errMsg = parsed.message;
+        }
+      } catch (e) {}
       setAnalysisError(errMsg);
     } finally {
-      clearTimeout(timeoutId);
       setIsAnalyzing(false);
     }
   };
@@ -1548,46 +1480,28 @@ export default function App() {
       const data: DailyCoachFeedback = await response.json();
       setCoachFeedback(data);
 
-      // Update the local tasks today status based on coach recommendation
-      const updatedTasks = tasks.map((t) => {
-        if (t.horizon === "today") {
-          const isMust = data.mustDoIds.includes(t.id);
-          const isNice = data.niceToDoIds.includes(t.id);
-          return {
-            ...t,
-            isMustDo: isMust,
-            isNiceToDo: isNice || !isMust // default remaining to nice to do
-          };
-        }
-        return t;
-      });
-
-      setTasks(updatedTasks);
-      for (const t of updatedTasks) {
-        if (t.horizon === "today") {
-          await saveTask(t);
-        }
+      // Re-read the LATEST tasks (the coach round-trip takes seconds; mapping
+      // the pre-request task list here used to clobber any edit that landed in
+      // the meantime). saveTask applies a functional state update + persists.
+      for (const t of tasksRef.current.filter((t) => t.horizon === "today")) {
+        const isMust = data.mustDoIds.includes(t.id);
+        const isNice = data.niceToDoIds.includes(t.id);
+        await saveTask({
+          ...t,
+          isMustDo: isMust,
+          isNiceToDo: isNice || !isMust // default remaining to nice to do
+        });
       }
     } catch (err) {
       console.error(err);
       // Fallback: manually divide them based on priority
-      const fallbackTasks = tasks.map((t) => {
-        if (t.horizon === "today") {
-          const isMust = t.priority === "high" || t.category === "north_star";
-          return {
-            ...t,
-            isMustDo: isMust,
-            isNiceToDo: !isMust
-          };
-        }
-        return t;
-      });
-
-      setTasks(fallbackTasks);
-      for (const t of fallbackTasks) {
-        if (t.horizon === "today") {
-          await saveTask(t);
-        }
+      for (const t of tasksRef.current.filter((t) => t.horizon === "today")) {
+        const isMust = t.priority === "high" || t.category === "north_star";
+        await saveTask({
+          ...t,
+          isMustDo: isMust,
+          isNiceToDo: !isMust
+        });
       }
 
       setCoachFeedback({
@@ -1911,6 +1825,22 @@ export default function App() {
         return diffA - diffB;
       });
   }, [tasks]);
+
+  // Triage results actually shown: always re-filtered against the CURRENT
+  // ignore lists. The server also pre-filters, but this guarantees that an
+  // ignore action (from this or any synced device) takes effect immediately,
+  // even for results fetched before the Firestore filters arrived.
+  const visibleTriagedEmails = useMemo(() => {
+    return triagedEmails.filter((email: any) => {
+      const id = email.emailId || email.id;
+      if (id && ignoredEmails.includes(id)) return false;
+      const address = extractEmailAddress(email.from || "");
+      if (ignoredSenders.includes(address)) return false;
+      const domain = extractEmailDomain(address);
+      if (ignoredDomains.some((d) => domain === d || domain.endsWith("." + d))) return false;
+      return true;
+    });
+  }, [triagedEmails, ignoredSenders, ignoredDomains, ignoredEmails]);
 
   // Authorized email list (matching requested email 'jazz@smallathon.com' and the dev/workspace email 'jez@smileathon.com')
   const allowedEmails = ["jazz@smallathon.com", "jez@smileathon.com"];
@@ -2320,44 +2250,31 @@ export default function App() {
 
                 {/* Date & State */}
                 <div className="flex items-center gap-2 sm:gap-4 flex-wrap">
-                  {/* Database Sync Status & Re-Sync Control */}
-                  <div className="flex items-center gap-2">
-                    {dbStatus === "connecting" && (
-                      <div className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-amber-50 text-amber-700 border border-amber-200 text-xs font-mono">
-                        <RefreshCw className="w-3.5 h-3.5 animate-spin text-amber-500" />
-                        <span>Connecting...</span>
-                      </div>
-                    )}
-                    {dbStatus === "synced" && (
-                      <div className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-emerald-50 text-emerald-700 border border-emerald-200 text-xs font-mono">
-                        <Cloud className="w-3.5 h-3.5 text-emerald-500" />
-                        <span>Cloud Live Sync</span>
-                      </div>
-                    )}
-                    {dbStatus === "offline" && (
-                      <div className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-neutral-100 text-neutral-600 border border-neutral-200 text-xs font-mono">
-                        <CloudOff className="w-3.5 h-3.5 text-neutral-400" />
-                        <span>Local Only</span>
-                      </div>
-                    )}
-                    {dbStatus === "error" && (
-                      <div className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-red-50 text-red-700 border border-red-200 text-xs font-mono">
-                        <AlertCircle className="w-3.5 h-3.5 text-red-500" />
-                        <span>DB Offline</span>
-                      </div>
-                    )}
-
-                    {/* Dedicated Dev Re-Sync Button */}
-                    <button
-                      onClick={handleReSyncAllData}
-                      disabled={isReSyncing}
-                      className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-mono font-bold transition-all cursor-pointer shadow-md active:scale-95 disabled:opacity-50 border border-emerald-500"
-                      title="Re-sync and restore all tasks and goals from Cloud and local storage"
-                    >
-                      <RefreshCw className={`w-3.5 h-3.5 ${isReSyncing ? "animate-spin text-amber-300" : "text-white"}`} />
-                      <span>{isReSyncing ? "Syncing..." : "🔄 Re-Sync Data"}</span>
-                    </button>
-                  </div>
+                  {/* Database Sync Status */}
+                  {dbStatus === "connecting" && (
+                    <div className="flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg bg-amber-50 text-amber-700 border border-amber-200 text-xs font-mono">
+                      <RefreshCw className="w-3.5 h-3.5 animate-spin text-amber-500" />
+                      <span>Connecting...</span>
+                    </div>
+                  )}
+                  {dbStatus === "synced" && (
+                    <div className="flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg bg-emerald-50 text-emerald-700 border border-emerald-200 text-xs font-mono">
+                      <Cloud className="w-3.5 h-3.5 text-emerald-500" />
+                      <span>Cloud Live Sync</span>
+                    </div>
+                  )}
+                  {dbStatus === "offline" && (
+                    <div className="flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg bg-neutral-100 text-neutral-600 border border-neutral-200 text-xs font-mono">
+                      <CloudOff className="w-3.5 h-3.5 text-neutral-400" />
+                      <span>Local Only</span>
+                    </div>
+                  )}
+                  {dbStatus === "error" && (
+                    <div className="flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg bg-red-50 text-red-700 border border-red-200 text-xs font-mono">
+                      <AlertCircle className="w-3.5 h-3.5 text-red-500" />
+                      <span>DB Offline</span>
+                    </div>
+                  )}
 
                   {/* Navigation View Switcher */}
                   <div className="flex bg-neutral-100 p-1 rounded-xl border border-neutral-200">
@@ -2387,9 +2304,9 @@ export default function App() {
                     >
                       <Mail className="w-3.5 h-3.5" />
                       <span>Email Triage</span>
-                      {triagedEmails.length > 0 && (
+                      {visibleTriagedEmails.length > 0 && (
                         <span className="absolute -top-1.5 -right-1.5 px-1.5 py-0.25 bg-amber-500 text-neutral-950 font-black rounded-full text-[8px] font-mono shadow border border-white">
-                          {triagedEmails.length}
+                          {visibleTriagedEmails.length}
                         </span>
                       )}
                     </button>
@@ -2433,17 +2350,6 @@ export default function App() {
 
             {/* Main Layout Container */}
             <main className="flex-1 max-w-7xl w-full mx-auto p-4 sm:p-8 flex flex-col gap-8">
-              {reSyncToast && (
-                <div className="bg-neutral-900 text-white px-4 py-2.5 rounded-xl border border-neutral-700 shadow-md text-xs font-mono font-bold flex items-center justify-between animate-fade-in shrink-0">
-                  <div className="flex items-center gap-2">
-                    <Cloud className="w-4 h-4 text-emerald-400 animate-pulse" />
-                    <span>{reSyncToast}</span>
-                  </div>
-                  <button onClick={() => setReSyncToast(null)} className="text-neutral-400 hover:text-white font-bold cursor-pointer text-sm">
-                    ×
-                  </button>
-                </div>
-              )}
               {activeView === "triage" && (
                 <div className="flex flex-col gap-6">
                   {/* Header info */}
@@ -2455,7 +2361,7 @@ export default function App() {
                       <div>
                         <h2 className="text-lg font-bold text-neutral-900 font-display">Email Triage Control Room</h2>
                         <p className="text-xs text-neutral-500 mt-1">
-                          AI-powered real-time parsing of your Gmail inbox (last 7 days) for high-velocity action conversion.
+                          AI-powered real-time parsing of your Gmail inbox (last 14 days) for high-velocity action conversion.
                         </p>
                       </div>
                     </div>
@@ -2488,7 +2394,7 @@ export default function App() {
                       <div>
                         <h3 className="text-base font-bold text-neutral-900 font-display">Connect your Gmail Inbox</h3>
                         <p className="text-xs text-neutral-500 mt-2 max-w-md mx-auto leading-relaxed">
-                          We scan the last 7 days of your inbox using secure Google OAuth and Gemini to automatically filter out spam/newsletters and isolate renewals, bill reminders, and high-importance client requests.
+                          We scan the last 14 days of your inbox using secure Google OAuth and Gemini to automatically filter out spam/newsletters and isolate renewals, bill reminders, and high-importance client requests.
                         </p>
                       </div>
 
@@ -2540,7 +2446,7 @@ export default function App() {
                           {/* Actions and sync panel */}
                           <div className="flex justify-between items-center bg-white rounded-2xl border border-neutral-200 p-4 shadow-sm">
                             <div className="text-xs text-neutral-500 font-semibold uppercase tracking-wider font-mono">
-                              {triagedEmails.length > 0 ? `${triagedEmails.length} Actionable Items Surfaced` : "Ready to Triage"}
+                              {visibleTriagedEmails.length > 0 ? `${visibleTriagedEmails.length} Actionable Items Surfaced` : "Ready to Triage"}
                             </div>
                             <button
                               onClick={() => fetchTriagedEmails()}
@@ -2666,7 +2572,7 @@ export default function App() {
                             </div>
                           )}
 
-                          {!isTriageLoading && !triageError && triagedEmails.length === 0 && (
+                          {!isTriageLoading && !triageError && visibleTriagedEmails.length === 0 && (
                             <div className="bg-white rounded-2xl border border-neutral-200 p-12 text-center shadow-sm flex flex-col items-center gap-4 max-w-xl mx-auto w-full my-6 animate-fade-in">
                               <div className="w-12 h-12 bg-emerald-50 rounded-xl flex items-center justify-center text-emerald-600">
                                 <CheckCircle2 className="w-6 h-6" />
@@ -2674,7 +2580,7 @@ export default function App() {
                               <div>
                                 <h4 className="text-sm font-bold text-neutral-900 font-display">Inbox Zero Actionable Items!</h4>
                                 <p className="text-xs text-neutral-400 mt-2 leading-relaxed">
-                                  No critical renewals, bills, or high-urgency client requests were detected in your inbox for the last 7 days. Your slate is clean!
+                                  No critical renewals, bills, or high-urgency client requests were detected in your inbox for the last 14 days. Your slate is clean!
                                 </p>
                               </div>
                               <button
@@ -2686,9 +2592,9 @@ export default function App() {
                             </div>
                           )}
 
-                          {!isTriageLoading && !triageError && triagedEmails.length > 0 && (
+                          {!isTriageLoading && !triageError && visibleTriagedEmails.length > 0 && (
                             <div className="grid grid-cols-1 md:grid-cols-2 gap-6 animate-fade-in">
-                              {triagedEmails.map((email: any) => {
+                              {visibleTriagedEmails.map((email: any) => {
                                 const isConverted = convertedEmailIds.includes(email.emailId);
                                 return (
                                   <div
@@ -2854,6 +2760,9 @@ export default function App() {
                                     const val = e.target.checked;
                                     setAutoSendDailySummary(val);
                                     safeLocalStorage.setItem("auto_send_daily_summary", val ? "true" : "false");
+                                    import("./lib/firebase")
+                                      .then(({ saveBriefingSettingsToDb }) => saveBriefingSettingsToDb({ autoSend: val }))
+                                      .catch((err) => console.error("Failed to sync briefing settings:", err));
                                   }}
                                   className="w-4 h-4 rounded border-neutral-300 text-neutral-900 focus:ring-neutral-900"
                                 />
@@ -2991,7 +2900,7 @@ export default function App() {
                                   <div className="flex justify-between items-center py-1.5">
                                     <span className="text-neutral-500">Triaged Email Alerts:</span>
                                     <span className="font-bold text-amber-600 font-mono">
-                                      {triagedEmails.length}
+                                      {visibleTriagedEmails.length}
                                     </span>
                                   </div>
                                 </div>
@@ -3089,8 +2998,8 @@ export default function App() {
                                     <div className="font-bold font-mono text-[9px] tracking-wider text-neutral-400 uppercase mb-2">
                                       3. UNRESOLVED GMAIL ACTIONS
                                     </div>
-                                    {triagedEmails.length > 0 ? (
-                                      triagedEmails.map((e, idx) => (
+                                    {visibleTriagedEmails.length > 0 ? (
+                                      visibleTriagedEmails.map((e, idx) => (
                                         <div key={idx} className="border-b border-neutral-50 py-2.5 text-xs">
                                           <div className="text-[9px] font-mono text-neutral-400 mb-0.5">FROM: {e.from}</div>
                                           <div className="flex items-center gap-1.5 flex-wrap">
@@ -3517,26 +3426,13 @@ export default function App() {
                                 key={`critical-${task.id}`}
                                 className={`p-3 rounded-xl border transition-all flex flex-col gap-2 ${status.colorClass}`}
                               >
-                                <div className="flex justify-between items-center gap-2 flex-wrap">
+                                <div className="flex justify-between items-center gap-2">
                                   <span className={`text-[9px] font-bold font-mono tracking-wider uppercase px-2 py-0.5 rounded ${status.badgeClass}`}>
                                     {status.level === "red" ? "CRITICAL" : "WATCHLIST"}
                                   </span>
-
-                                  <div className="flex items-center gap-1.5">
-                                    <span className="text-[9px] font-mono font-semibold text-neutral-500">
-                                      {task.isForceCritical ? "Flagged Critical" : (status.daysLeft < 0 ? "Overdue!" : status.daysLeft === 0 ? "Due Today" : `${status.daysLeft}d left`)}
-                                    </span>
-
-                                    {/* Real-time Toggle Off Critical Status Button */}
-                                    <button
-                                      onClick={() => handleToggleForceCritical(task.id, task.isForceCritical)}
-                                      className="text-[9px] font-mono font-bold text-red-700 bg-white hover:bg-red-100/80 border border-red-300 rounded px-1.5 py-0.5 flex items-center gap-1 cursor-pointer transition-all shadow-2xs"
-                                      title="Click to mark as not critical (removes from Critical Items instantly)"
-                                    >
-                                      <Flame className="w-3 h-3 text-red-600 fill-red-600" />
-                                      Unflag Critical
-                                    </button>
-                                  </div>
+                                  <span className="text-[9px] font-mono font-semibold text-neutral-500">
+                                    {task.isForceCritical ? "Flagged Critical" : (status.daysLeft < 0 ? "Overdue!" : status.daysLeft === 0 ? "Due Today" : `${status.daysLeft}d left`)}
+                                  </span>
                                 </div>
 
                                 <h4 className={`text-xs font-semibold leading-tight ${status.textColor}`}>
@@ -3553,38 +3449,14 @@ export default function App() {
                                   </div>
                                 )}
 
-                                <div className="flex items-center justify-between gap-2 border-t border-neutral-200/40 pt-2 mt-0.5 flex-wrap">
-                                  <div className="flex items-center gap-1.5">
-                                    <button
-                                      onClick={() => handleToggleComplete(task.id)}
-                                      className="text-[10px] font-semibold bg-white hover:bg-neutral-50 border border-neutral-200 rounded px-2 py-1 text-neutral-800 transition-colors flex items-center gap-1 cursor-pointer"
-                                    >
-                                      <Check className="w-3 h-3 text-emerald-600" />
-                                      Done
-                                    </button>
-
-                                    {/* Inline Quick Due Date Editor for Critical Items */}
-                                    <div className="flex items-center gap-1 bg-white border border-neutral-200 rounded px-1.5 py-0.5" title="Quickly edit due date">
-                                      <Calendar className="w-3 h-3 text-neutral-500 shrink-0" />
-                                      <span className="text-[9px] font-mono font-bold text-neutral-500 uppercase">Due:</span>
-                                      <input
-                                        type="date"
-                                        value={task.dropDeadDate || ""}
-                                        onChange={(e) => handleQuickUpdateDate(task.id, e.target.value)}
-                                        className="text-[10px] font-mono font-semibold text-neutral-900 bg-white border border-neutral-300 rounded px-1 py-0.5 cursor-pointer focus:outline-none focus:ring-1 focus:ring-neutral-900 w-[110px]"
-                                      />
-                                      {task.dropDeadDate && (
-                                        <button
-                                          type="button"
-                                          onClick={() => handleQuickUpdateDate(task.id, "")}
-                                          className="text-neutral-400 hover:text-red-600 font-bold text-xs px-1 hover:bg-red-50 rounded transition-colors cursor-pointer"
-                                          title="Clear due date"
-                                        >
-                                          &times;
-                                        </button>
-                                      )}
-                                    </div>
-                                  </div>
+                                <div className="flex items-center justify-between gap-2 border-t border-neutral-200/40 pt-2 mt-0.5">
+                                  <button
+                                    onClick={() => handleToggleComplete(task.id)}
+                                    className="text-[10px] font-semibold bg-white hover:bg-neutral-50 border border-neutral-200 rounded px-2 py-1 text-neutral-800 transition-colors flex items-center gap-1"
+                                  >
+                                    <Check className="w-3 h-3 text-emerald-600" />
+                                    Done
+                                  </button>
 
                                   <div className="flex items-center gap-1">
                                     <span className="text-[9px] font-mono text-neutral-500">Move:</span>
@@ -3909,7 +3781,6 @@ export default function App() {
                             {filteredTasks.map((task) => {
                               const deadline = getDeadlineBadgeStyle(task.dropDeadDate);
                               const isEditing = activeEditingTaskId === task.id;
-                              const isTaskCritical = task.isForceCritical || (!!task.dropDeadDate && task.dropDeadDate.trim() !== "" && getCriticalStatus(task) !== null);
 
                               return (
                                 <motion.div
@@ -3989,31 +3860,6 @@ export default function App() {
                                         </span>
                                       ))}
 
-                                      {/* Inline Quick Due Date Selector */}
-                                      <div
-                                        className="inline-flex items-center gap-1.5 bg-neutral-100/90 border border-neutral-200/80 rounded-md px-2 py-0.5 text-[9px] font-mono transition-all"
-                                        title="Click to edit due date directly"
-                                      >
-                                        <Calendar className="w-3 h-3 text-neutral-600 shrink-0" />
-                                        <span className="text-neutral-600 font-bold uppercase tracking-wider">Due:</span>
-                                        <input
-                                          type="date"
-                                          value={task.dropDeadDate || ""}
-                                          onChange={(e) => handleQuickUpdateDate(task.id, e.target.value)}
-                                          className="bg-white border border-neutral-300 rounded px-1 py-0.5 text-neutral-900 font-mono text-[10px] font-semibold cursor-pointer focus:outline-none focus:ring-1 focus:ring-neutral-900 w-[115px]"
-                                        />
-                                        {task.dropDeadDate && (
-                                          <button
-                                            type="button"
-                                            onClick={() => handleQuickUpdateDate(task.id, "")}
-                                            className="text-neutral-400 hover:text-red-600 font-bold text-xs px-1 hover:bg-red-50 rounded transition-colors cursor-pointer"
-                                            title="Clear due date"
-                                          >
-                                            ×
-                                          </button>
-                                        )}
-                                      </div>
-
                                       {/* Focus Type Cycle Control */}
                                       <button
                                         onClick={() => handleToggleFocusType(task.id, task.isMustDo, task.isNiceToDo)}
@@ -4038,19 +3884,14 @@ export default function App() {
                                       {/* Force Critical Toggle Control */}
                                       <button
                                         onClick={() => handleToggleForceCritical(task.id, task.isForceCritical)}
-                                        className={`text-[9px] font-mono px-2 py-0.5 rounded-md font-bold transition-all flex items-center gap-1 border cursor-pointer ${
-                                          isTaskCritical
-                                            ? "bg-red-100 text-red-900 border-red-300 hover:bg-red-200"
+                                        className={`text-[9px] font-mono px-1.5 py-0.25 rounded-md font-semibold transition-all flex items-center gap-1 border cursor-pointer ${
+                                          task.isForceCritical
+                                            ? "bg-red-100 text-red-900 border-red-300 hover:bg-red-200 animate-pulse"
                                             : "bg-neutral-50 text-neutral-400 border-neutral-200 hover:bg-neutral-100 hover:text-neutral-600"
                                         }`}
-                                        title={
-                                          isTaskCritical
-                                            ? "Click to remove from Critical Items (clears drop-dead date & critical flag)"
-                                            : "Click to flag as Critical Item"
-                                        }
+                                        title="Toggle Forced Critical Status (includes in Critical Items)"
                                       >
-                                        <Flame className={`w-3 h-3 ${isTaskCritical ? "text-red-600 fill-red-600" : "text-neutral-400"}`} />
-                                        {isTaskCritical ? "Unflag Critical" : "Flag Critical"}
+                                        🔥 {task.isForceCritical ? "Critical Flag" : "Flag Critical"}
                                       </button>
                                     </div>
 
