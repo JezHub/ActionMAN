@@ -241,8 +241,17 @@ export default function App() {
   // --- Persistent State ---
   const [tasks, setTasks] = useState<Task[]>(() => {
     const saved = safeLocalStorage.getItem("brain_dump_tasks");
-    return saved ? JSON.parse(saved) : INITIAL_TASKS;
+    if (saved) {
+      try {
+        const parsed = JSON.parse(saved);
+        if (Array.isArray(parsed)) return parsed;
+      } catch (e) {}
+    }
+    return INITIAL_TASKS;
   });
+
+  const [isReSyncing, setIsReSyncing] = useState(false);
+  const [reSyncToast, setReSyncToast] = useState<string | null>(null);
 
   // Latest tasks for async callbacks (coach review, etc.) that would otherwise
   // operate on the stale list captured before their awaits
@@ -264,6 +273,7 @@ export default function App() {
       setTasks([]);
       setNorthStar({ title: "", description: "" });
       safeLocalStorage.removeItem("brain_dump_tasks");
+      safeLocalStorage.removeItem("brain_dump_tasks_backup");
       safeLocalStorage.removeItem("brain_dump_north_star");
       
       if (dbStatus === "synced" || dbStatus === "connecting") {
@@ -273,6 +283,32 @@ export default function App() {
       setShowResetConfirm(false);
     } catch (e) {
       console.error("Error resetting all data:", e);
+    }
+  };
+
+  const handleReSyncAllData = async () => {
+    setIsReSyncing(true);
+    try {
+      const { flushPendingWrites } = await import("./lib/firebase");
+      // Live snapshots keep state current; this just confirms every queued
+      // local write has reached the server (or reports that we're offline).
+      const flushed = await Promise.race([
+        flushPendingWrites().then(() => true),
+        new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 10000))
+      ]);
+      if (flushed) {
+        setDbStatus("synced");
+        setReSyncToast("All changes are synced to the cloud.");
+      } else {
+        setReSyncToast("Still waiting for the network — changes will sync automatically when you're back online.");
+      }
+      setTimeout(() => setReSyncToast(null), 4500);
+    } catch (err: any) {
+      console.error("Re-sync error:", err);
+      setReSyncToast("Sync check failed — changes will retry automatically.");
+      setTimeout(() => setReSyncToast(null), 3000);
+    } finally {
+      setIsReSyncing(false);
     }
   };
 
@@ -1146,11 +1182,46 @@ export default function App() {
   };
 
   const handleToggleForceCritical = async (taskId: string, currentIsForceCritical?: boolean) => {
+    const targetTask = tasks.find((t) => t.id === taskId);
+    const isCurrentlyCritical =
+      !!currentIsForceCritical ||
+      !!targetTask?.isForceCritical ||
+      (!!targetTask?.dropDeadDate && targetTask.dropDeadDate.trim() !== "" && getCriticalStatus(targetTask) !== null);
+
+    const updatedTasks = tasks.map((t) => {
+      if (t.id === taskId) {
+        if (isCurrentlyCritical) {
+          // Unflag critical: remove force critical AND clear drop-dead date so it instantly leaves Critical Items
+          return {
+            ...t,
+            isForceCritical: false,
+            dropDeadDate: undefined
+          };
+        } else {
+          // Flag as critical item
+          return {
+            ...t,
+            isForceCritical: true
+          };
+        }
+      }
+      return t;
+    });
+
+    setTasks(updatedTasks);
+
+    const updatedTask = updatedTasks.find((t) => t.id === taskId);
+    if (updatedTask) {
+      await saveTask(updatedTask);
+    }
+  };
+
+  const handleQuickUpdateDate = async (taskId: string, newDateStr: string) => {
     const updatedTasks = tasks.map((t) => {
       if (t.id === taskId) {
         return {
           ...t,
-          isForceCritical: !currentIsForceCritical
+          dropDeadDate: newDateStr.trim() ? newDateStr.trim() : undefined
         };
       }
       return t;
@@ -1289,6 +1360,27 @@ export default function App() {
   const todayDateObj = new Date();
   const todayStr = todayDateObj.toLocaleDateString("en-CA");
 
+  const getValidDateString = (dateStr?: string): string => {
+    if (!dateStr || typeof dateStr !== "string") return "";
+    const clean = dateStr.split("T")[0].trim();
+    if (clean === "null" || clean === "undefined" || clean === "tags" || clean === "due date") return "";
+    const parts = clean.split("-").map(Number);
+    if (
+      parts.length === 3 &&
+      !isNaN(parts[0]) &&
+      !isNaN(parts[1]) &&
+      !isNaN(parts[2]) &&
+      parts[0] > 1900 &&
+      parts[1] >= 1 &&
+      parts[1] <= 12 &&
+      parts[2] >= 1 &&
+      parts[2] <= 31
+    ) {
+      return clean;
+    }
+    return "";
+  };
+
   const getCriticalStatus = (task: Task) => {
     if (task.isForceCritical) {
       return {
@@ -1301,12 +1393,13 @@ export default function App() {
         isForced: true
       };
     }
-    if (!task.dropDeadDate) return null;
-    const taskDate = new Date(task.dropDeadDate);
+    const cleanDate = getValidDateString(task.dropDeadDate);
+    if (!cleanDate) return null;
+    const dateParts = cleanDate.split("-").map(Number);
+    const taskMidnight = new Date(dateParts[0], dateParts[1] - 1, dateParts[2]);
     const currentMidnight = new Date(todayDateObj.getFullYear(), todayDateObj.getMonth(), todayDateObj.getDate());
-    const taskMidnight = new Date(taskDate.getFullYear(), taskDate.getMonth(), taskDate.getDate());
     const diffTime = taskMidnight.getTime() - currentMidnight.getTime();
-    const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+    const diffDays = Math.round(diffTime / (1000 * 60 * 60 * 24));
 
     if (diffDays <= 5) {
       return {
@@ -1330,11 +1423,14 @@ export default function App() {
     return null;
   };
 
-  const getDeadlineBadgeStyle = (dateStr?: string) => {
-    if (!dateStr) return null;
-    const taskDate = new Date(dateStr);
-    const diffTime = taskDate.getTime() - todayDateObj.getTime();
-    const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+  const getDeadlineBadgeStyle = (rawDateStr?: string) => {
+    const cleanDate = getValidDateString(rawDateStr);
+    if (!cleanDate) return null;
+    const dateParts = cleanDate.split("-").map(Number);
+    const taskMidnight = new Date(dateParts[0], dateParts[1] - 1, dateParts[2]);
+    const currentMidnight = new Date(todayDateObj.getFullYear(), todayDateObj.getMonth(), todayDateObj.getDate());
+    const diffTime = taskMidnight.getTime() - currentMidnight.getTime();
+    const diffDays = Math.round(diffTime / (1000 * 60 * 60 * 24));
 
     if (diffDays < 0) {
       return { text: `Overdue by ${Math.abs(diffDays)}d`, color: "bg-red-100 text-red-800 border-red-300 font-semibold" };
@@ -1345,7 +1441,7 @@ export default function App() {
     } else if (diffDays <= 14) {
       return { text: `Drop-dead in ${diffDays}d`, color: "bg-amber-50 text-amber-800 border-amber-200" };
     } else {
-      return { text: `Due ${dateStr}`, color: "bg-neutral-50 text-neutral-600 border-neutral-200" };
+      return { text: `Due ${cleanDate}`, color: "bg-neutral-50 text-neutral-600 border-neutral-200" };
     }
   };
 
@@ -1357,56 +1453,69 @@ export default function App() {
     setIsAnalyzing(true);
     setAnalysisError(null);
 
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 12000); // 12-second max timeout
+
     try {
-      const response = await fetch("/api/organize-dump", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          dumpText: textToAnalyze,
-          currentDate: todayStr,
-          northStar: `${northStar.title}: ${northStar.description}`
-        })
-      });
-
-      if (!response.ok) {
-        const text = await response.text().catch(() => "");
-        let errorMsg = "Failed to process brain dump. Please ensure API key is active.";
-        try {
-          const errData = JSON.parse(text);
-          errorMsg = errData.error || errorMsg;
-        } catch (_) {
-          errorMsg = text || errorMsg;
-        }
-        throw new Error(errorMsg);
-      }
-
-      const text = await response.text();
-      if (!text || text.trim() === "") {
-        throw new Error("Server returned an empty response. Please try again.");
-      }
-
-      let data;
+      let data: any = null;
       try {
-        data = JSON.parse(text);
-      } catch (_) {
-        if (text.toLowerCase().includes("upstream")) {
-          throw new Error("The server is temporarily busy or connection timed out. Please try again in a moment.");
+        const response = await fetch("/api/organize-dump", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            dumpText: textToAnalyze,
+            currentDate: todayStr,
+            northStar: `${northStar.title}: ${northStar.description}`
+          }),
+          signal: controller.signal
+        });
+
+        clearTimeout(timeoutId);
+
+        if (response.ok) {
+          const text = await response.text();
+          if (text && text.trim() !== "") {
+            data = JSON.parse(text);
+          }
         }
-        throw new Error("Received an invalid response format from the server.");
+      } catch (fetchErr) {
+        console.warn("API organize-dump call timed out or failed, utilizing fast fallback parser.", fetchErr);
       }
+
+      clearTimeout(timeoutId);
+
+      // Fallback if API response wasn't received or parsed
+      if (!data || !data.items || !Array.isArray(data.items)) {
+        const lines = textToAnalyze.split(/\n+/).map((l) => l.replace(/^[-*•\d.\s]+/, "").trim()).filter((l) => l.length > 0);
+        data = {
+          items: lines.map((line) => ({
+            title: line,
+            priority: "medium",
+            horizon: "this_week",
+            category: "general",
+            dropDeadDate: null,
+            reasoning: "Extracted directly from brain dump."
+          }))
+        };
+      }
+
       if (data.items && Array.isArray(data.items)) {
-        const generatedTasks: Task[] = data.items.map((item: any, idx: number) => ({
-          id: `task-gemini-${Date.now()}-${idx}`,
-          title: item.title,
-          priority: item.priority || "medium",
-          horizon: item.horizon || "backlog",
-          category: item.category || "general",
-          dropDeadDate: item.dropDeadDate || undefined,
-          reasoning: item.reasoning,
-          completed: false,
-          createdAt: new Date().toISOString(),
-          tags: item.tags || detectTags(item.title)
-        }));
+        const generatedTasks: Task[] = data.items.map((item: any, idx: number) => {
+          const rawDateStr = (item.dropDeadDate && typeof item.dropDeadDate === "string" && item.dropDeadDate !== "null" && item.dropDeadDate !== "undefined" && item.dropDeadDate.trim() !== "") ? item.dropDeadDate.trim() : undefined;
+          const cleanDate = rawDateStr ? rawDateStr.split("T")[0] : undefined;
+          return {
+            id: `task-gemini-${Date.now()}-${idx}`,
+            title: item.title || textToAnalyze.trim(),
+            priority: item.priority || "medium",
+            horizon: item.horizon || "this_week",
+            category: item.category || "general",
+            dropDeadDate: cleanDate,
+            reasoning: item.reasoning,
+            completed: false,
+            createdAt: new Date().toISOString(),
+            tags: item.tags || detectTags(item.title || "")
+          };
+        });
 
         const toSaveImmediately: Task[] = [];
         const duplicatesFound: any[] = [];
@@ -1442,17 +1551,10 @@ export default function App() {
       }
     } catch (err: any) {
       console.error(err);
-      let errMsg = err.message || "Something went wrong communicating with the coach.";
-      try {
-        const parsed = JSON.parse(errMsg);
-        if (parsed.error && parsed.error.message) {
-          errMsg = parsed.error.message;
-        } else if (parsed.message) {
-          errMsg = parsed.message;
-        }
-      } catch (e) {}
+      let errMsg = err.message || "Something went wrong processing your brain dump.";
       setAnalysisError(errMsg);
     } finally {
+      clearTimeout(timeoutId);
       setIsAnalyzing(false);
     }
   };
@@ -2250,31 +2352,44 @@ export default function App() {
 
                 {/* Date & State */}
                 <div className="flex items-center gap-2 sm:gap-4 flex-wrap">
-                  {/* Database Sync Status */}
-                  {dbStatus === "connecting" && (
-                    <div className="flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg bg-amber-50 text-amber-700 border border-amber-200 text-xs font-mono">
-                      <RefreshCw className="w-3.5 h-3.5 animate-spin text-amber-500" />
-                      <span>Connecting...</span>
-                    </div>
-                  )}
-                  {dbStatus === "synced" && (
-                    <div className="flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg bg-emerald-50 text-emerald-700 border border-emerald-200 text-xs font-mono">
-                      <Cloud className="w-3.5 h-3.5 text-emerald-500" />
-                      <span>Cloud Live Sync</span>
-                    </div>
-                  )}
-                  {dbStatus === "offline" && (
-                    <div className="flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg bg-neutral-100 text-neutral-600 border border-neutral-200 text-xs font-mono">
-                      <CloudOff className="w-3.5 h-3.5 text-neutral-400" />
-                      <span>Local Only</span>
-                    </div>
-                  )}
-                  {dbStatus === "error" && (
-                    <div className="flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg bg-red-50 text-red-700 border border-red-200 text-xs font-mono">
-                      <AlertCircle className="w-3.5 h-3.5 text-red-500" />
-                      <span>DB Offline</span>
-                    </div>
-                  )}
+                  {/* Database Sync Status & Re-Sync Control */}
+                  <div className="flex items-center gap-2">
+                    {dbStatus === "connecting" && (
+                      <div className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-amber-50 text-amber-700 border border-amber-200 text-xs font-mono">
+                        <RefreshCw className="w-3.5 h-3.5 animate-spin text-amber-500" />
+                        <span>Connecting...</span>
+                      </div>
+                    )}
+                    {dbStatus === "synced" && (
+                      <div className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-emerald-50 text-emerald-700 border border-emerald-200 text-xs font-mono">
+                        <Cloud className="w-3.5 h-3.5 text-emerald-500" />
+                        <span>Cloud Live Sync</span>
+                      </div>
+                    )}
+                    {dbStatus === "offline" && (
+                      <div className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-neutral-100 text-neutral-600 border border-neutral-200 text-xs font-mono">
+                        <CloudOff className="w-3.5 h-3.5 text-neutral-400" />
+                        <span>Local Only</span>
+                      </div>
+                    )}
+                    {dbStatus === "error" && (
+                      <div className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-red-50 text-red-700 border border-red-200 text-xs font-mono">
+                        <AlertCircle className="w-3.5 h-3.5 text-red-500" />
+                        <span>DB Offline</span>
+                      </div>
+                    )}
+
+                    {/* Dedicated Dev Re-Sync Button */}
+                    <button
+                      onClick={handleReSyncAllData}
+                      disabled={isReSyncing}
+                      className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-mono font-bold transition-all cursor-pointer shadow-md active:scale-95 disabled:opacity-50 border border-emerald-500"
+                      title="Re-sync and restore all tasks and goals from Cloud and local storage"
+                    >
+                      <RefreshCw className={`w-3.5 h-3.5 ${isReSyncing ? "animate-spin text-amber-300" : "text-white"}`} />
+                      <span>{isReSyncing ? "Syncing..." : "🔄 Re-Sync Data"}</span>
+                    </button>
+                  </div>
 
                   {/* Navigation View Switcher */}
                   <div className="flex bg-neutral-100 p-1 rounded-xl border border-neutral-200">
@@ -2350,6 +2465,17 @@ export default function App() {
 
             {/* Main Layout Container */}
             <main className="flex-1 max-w-7xl w-full mx-auto p-4 sm:p-8 flex flex-col gap-8">
+              {reSyncToast && (
+                <div className="bg-neutral-900 text-white px-4 py-2.5 rounded-xl border border-neutral-700 shadow-md text-xs font-mono font-bold flex items-center justify-between animate-fade-in shrink-0">
+                  <div className="flex items-center gap-2">
+                    <Cloud className="w-4 h-4 text-emerald-400 animate-pulse" />
+                    <span>{reSyncToast}</span>
+                  </div>
+                  <button onClick={() => setReSyncToast(null)} className="text-neutral-400 hover:text-white font-bold cursor-pointer text-sm">
+                    ×
+                  </button>
+                </div>
+              )}
               {activeView === "triage" && (
                 <div className="flex flex-col gap-6">
                   {/* Header info */}
@@ -3426,13 +3552,26 @@ export default function App() {
                                 key={`critical-${task.id}`}
                                 className={`p-3 rounded-xl border transition-all flex flex-col gap-2 ${status.colorClass}`}
                               >
-                                <div className="flex justify-between items-center gap-2">
+                                <div className="flex justify-between items-center gap-2 flex-wrap">
                                   <span className={`text-[9px] font-bold font-mono tracking-wider uppercase px-2 py-0.5 rounded ${status.badgeClass}`}>
                                     {status.level === "red" ? "CRITICAL" : "WATCHLIST"}
                                   </span>
-                                  <span className="text-[9px] font-mono font-semibold text-neutral-500">
-                                    {task.isForceCritical ? "Flagged Critical" : (status.daysLeft < 0 ? "Overdue!" : status.daysLeft === 0 ? "Due Today" : `${status.daysLeft}d left`)}
-                                  </span>
+
+                                  <div className="flex items-center gap-1.5">
+                                    <span className="text-[9px] font-mono font-semibold text-neutral-500">
+                                      {task.isForceCritical ? "Flagged Critical" : (status.daysLeft < 0 ? "Overdue!" : status.daysLeft === 0 ? "Due Today" : `${status.daysLeft}d left`)}
+                                    </span>
+
+                                    {/* Real-time Toggle Off Critical Status Button */}
+                                    <button
+                                      onClick={() => handleToggleForceCritical(task.id, task.isForceCritical)}
+                                      className="text-[9px] font-mono font-bold text-red-700 bg-white hover:bg-red-100/80 border border-red-300 rounded px-1.5 py-0.5 flex items-center gap-1 cursor-pointer transition-all shadow-2xs"
+                                      title="Click to mark as not critical (removes from Critical Items instantly)"
+                                    >
+                                      <Flame className="w-3 h-3 text-red-600 fill-red-600" />
+                                      Unflag Critical
+                                    </button>
+                                  </div>
                                 </div>
 
                                 <h4 className={`text-xs font-semibold leading-tight ${status.textColor}`}>
@@ -3449,14 +3588,38 @@ export default function App() {
                                   </div>
                                 )}
 
-                                <div className="flex items-center justify-between gap-2 border-t border-neutral-200/40 pt-2 mt-0.5">
-                                  <button
-                                    onClick={() => handleToggleComplete(task.id)}
-                                    className="text-[10px] font-semibold bg-white hover:bg-neutral-50 border border-neutral-200 rounded px-2 py-1 text-neutral-800 transition-colors flex items-center gap-1"
-                                  >
-                                    <Check className="w-3 h-3 text-emerald-600" />
-                                    Done
-                                  </button>
+                                <div className="flex items-center justify-between gap-2 border-t border-neutral-200/40 pt-2 mt-0.5 flex-wrap">
+                                  <div className="flex items-center gap-1.5">
+                                    <button
+                                      onClick={() => handleToggleComplete(task.id)}
+                                      className="text-[10px] font-semibold bg-white hover:bg-neutral-50 border border-neutral-200 rounded px-2 py-1 text-neutral-800 transition-colors flex items-center gap-1 cursor-pointer"
+                                    >
+                                      <Check className="w-3 h-3 text-emerald-600" />
+                                      Done
+                                    </button>
+
+                                    {/* Inline Quick Due Date Editor for Critical Items */}
+                                    <div className="flex items-center gap-1 bg-white border border-neutral-200 rounded px-1.5 py-0.5" title="Quickly edit due date">
+                                      <Calendar className="w-3 h-3 text-neutral-500 shrink-0" />
+                                      <span className="text-[9px] font-mono font-bold text-neutral-500 uppercase">Due:</span>
+                                      <input
+                                        type="date"
+                                        value={task.dropDeadDate || ""}
+                                        onChange={(e) => handleQuickUpdateDate(task.id, e.target.value)}
+                                        className="text-[10px] font-mono font-semibold text-neutral-900 bg-white border border-neutral-300 rounded px-1 py-0.5 cursor-pointer focus:outline-none focus:ring-1 focus:ring-neutral-900 w-[110px]"
+                                      />
+                                      {task.dropDeadDate && (
+                                        <button
+                                          type="button"
+                                          onClick={() => handleQuickUpdateDate(task.id, "")}
+                                          className="text-neutral-400 hover:text-red-600 font-bold text-xs px-1 hover:bg-red-50 rounded transition-colors cursor-pointer"
+                                          title="Clear due date"
+                                        >
+                                          &times;
+                                        </button>
+                                      )}
+                                    </div>
+                                  </div>
 
                                   <div className="flex items-center gap-1">
                                     <span className="text-[9px] font-mono text-neutral-500">Move:</span>
@@ -3781,6 +3944,7 @@ export default function App() {
                             {filteredTasks.map((task) => {
                               const deadline = getDeadlineBadgeStyle(task.dropDeadDate);
                               const isEditing = activeEditingTaskId === task.id;
+                              const isTaskCritical = task.isForceCritical || (!!task.dropDeadDate && task.dropDeadDate.trim() !== "" && getCriticalStatus(task) !== null);
 
                               return (
                                 <motion.div
@@ -3860,6 +4024,51 @@ export default function App() {
                                         </span>
                                       ))}
 
+                                      {/* Inline Quick Due Date Selector */}
+                                      <div
+                                        className="inline-flex items-center gap-1.5 bg-neutral-100 border border-neutral-200/90 rounded-lg px-2 py-1 text-[10px] font-mono transition-all shadow-2xs flex-wrap sm:flex-nowrap"
+                                        title="Click to edit due date directly"
+                                      >
+                                        <Calendar className="w-3.5 h-3.5 text-neutral-600 shrink-0" />
+                                        <span className="text-neutral-700 font-bold uppercase tracking-wider text-[10px]">Due:</span>
+                                        <input
+                                          type="date"
+                                          value={getValidDateString(task.dropDeadDate)}
+                                          onChange={(e) => handleQuickUpdateDate(task.id, e.target.value)}
+                                          className="bg-white border border-neutral-300 rounded px-1.5 py-0.5 text-neutral-900 font-mono text-xs font-bold cursor-pointer focus:outline-none focus:ring-1 focus:ring-neutral-900 w-[120px]"
+                                        />
+                                        <button
+                                          type="button"
+                                          onClick={() => handleQuickUpdateDate(task.id, todayStr)}
+                                          className="text-[9px] font-mono font-bold bg-white border border-neutral-200 hover:bg-neutral-50 text-neutral-700 px-1.5 py-0.5 rounded cursor-pointer"
+                                          title="Set due date to Today"
+                                        >
+                                          Today
+                                        </button>
+                                        <button
+                                          type="button"
+                                          onClick={() => {
+                                            const tmrw = new Date();
+                                            tmrw.setDate(tmrw.getDate() + 1);
+                                            handleQuickUpdateDate(task.id, tmrw.toISOString().split("T")[0]);
+                                          }}
+                                          className="text-[9px] font-mono font-bold bg-white border border-neutral-200 hover:bg-neutral-50 text-neutral-700 px-1.5 py-0.5 rounded cursor-pointer"
+                                          title="Set due date to Tomorrow"
+                                        >
+                                          Tmrw
+                                        </button>
+                                        {getValidDateString(task.dropDeadDate) && (
+                                          <button
+                                            type="button"
+                                            onClick={() => handleQuickUpdateDate(task.id, "")}
+                                            className="text-neutral-500 hover:text-red-600 font-bold text-xs px-1.5 py-0.5 hover:bg-red-50 rounded transition-colors cursor-pointer"
+                                            title="Clear due date"
+                                          >
+                                            Clear ×
+                                          </button>
+                                        )}
+                                      </div>
+
                                       {/* Focus Type Cycle Control */}
                                       <button
                                         onClick={() => handleToggleFocusType(task.id, task.isMustDo, task.isNiceToDo)}
@@ -3883,15 +4092,20 @@ export default function App() {
 
                                       {/* Force Critical Toggle Control */}
                                       <button
-                                        onClick={() => handleToggleForceCritical(task.id, task.isForceCritical)}
-                                        className={`text-[9px] font-mono px-1.5 py-0.25 rounded-md font-semibold transition-all flex items-center gap-1 border cursor-pointer ${
-                                          task.isForceCritical
-                                            ? "bg-red-100 text-red-900 border-red-300 hover:bg-red-200 animate-pulse"
-                                            : "bg-neutral-50 text-neutral-400 border-neutral-200 hover:bg-neutral-100 hover:text-neutral-600"
+                                        onClick={() => handleToggleForceCritical(task.id, isTaskCritical)}
+                                        className={`text-[10px] font-mono px-2.5 py-1 rounded-lg font-bold transition-all flex items-center gap-1.5 border cursor-pointer shadow-2xs ${
+                                          isTaskCritical
+                                            ? "bg-red-100 text-red-900 border-red-300 hover:bg-red-200"
+                                            : "bg-neutral-100 text-neutral-600 border-neutral-200 hover:bg-neutral-200/80"
                                         }`}
-                                        title="Toggle Forced Critical Status (includes in Critical Items)"
+                                        title={
+                                          isTaskCritical
+                                            ? "Click to UNFLAG critical (removes from Critical Items list instantly)"
+                                            : "Click to FLAG as critical item"
+                                        }
                                       >
-                                        🔥 {task.isForceCritical ? "Critical Flag" : "Flag Critical"}
+                                        <Flame className={`w-3.5 h-3.5 ${isTaskCritical ? "text-red-600 fill-red-600" : "text-neutral-500"}`} />
+                                        <span>{isTaskCritical ? "Unflag Critical" : "Flag Critical"}</span>
                                       </button>
                                     </div>
 

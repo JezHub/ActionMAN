@@ -104,8 +104,8 @@ function resolveDateContext(currentDate?: string) {
 
 // 1. API: Organize Brain Dump
 app.post("/api/organize-dump", async (req, res) => {
+  const { dumpText, currentDate, northStar } = req.body || {};
   try {
-    const { dumpText, currentDate, northStar } = req.body;
     if (!dumpText || !dumpText.trim()) {
       return res.status(400).json({ error: "No brain dump text provided." });
     }
@@ -179,11 +179,29 @@ Please parse every single distinct line, item, or thought from the above text in
       },
     });
 
-    const parsedData = JSON.parse(response.text || "[]");
+    const rawParsed = JSON.parse(response.text || "[]");
+    // Sanitize model output: "null"/"undefined"/empty strings must never leak
+    // into dropDeadDate as fake deadlines
+    const parsedData = Array.isArray(rawParsed) ? rawParsed.map((item: any) => ({
+      ...item,
+      dropDeadDate: (item.dropDeadDate && typeof item.dropDeadDate === "string" && item.dropDeadDate !== "null" && item.dropDeadDate !== "undefined" && item.dropDeadDate.trim() !== "") ? item.dropDeadDate.trim() : null
+    })) : [];
     res.json({ items: parsedData });
   } catch (error: any) {
-    console.error("Error organizing brain dump:", error);
-    res.status(500).json({ error: error.message || "Failed to organize brain dump." });
+    // Never lose a brain dump to an AI outage: fall back to a plain
+    // line-by-line parse so every item is still captured as a task.
+    console.error("Error organizing brain dump with Gemini, using fallback parser:", error);
+    const lines = String(dumpText || "").split(/\n+/).map((l: string) => l.replace(/^[-*•\d.\s]+/, "").trim()).filter((l: string) => l.length > 0);
+    const fallbackItems = (lines.length > 0 ? lines : [String(dumpText || "").trim()]).map((line: string) => ({
+      title: line,
+      priority: "medium",
+      horizon: "this_week",
+      category: "general",
+      dropDeadDate: null,
+      reasoning: "Captured without AI analysis (Gemini was unavailable).",
+      tags: []
+    }));
+    res.json({ items: fallbackItems });
   }
 });
 

@@ -12,7 +12,8 @@ import {
   onSnapshot,
   writeBatch,
   arrayUnion,
-  arrayRemove
+  arrayRemove,
+  waitForPendingWrites
 } from "firebase/firestore";
 import firebaseConfig from "../../firebase-applet-config.json";
 import { Task, NorthStar } from "../types";
@@ -261,6 +262,15 @@ export function subscribeBriefingSettings(
 
 export async function saveBriefingSettingsToDb(settings: { autoSend?: boolean; lastSentDate?: string }) {
   await setDoc(doc(db, SETTINGS_COLL, "briefing"), settings, { merge: true });
+}
+
+/**
+ * Resolves once every locally-queued write has been acknowledged by the
+ * server. Used by the manual "Re-Sync" button to CONFIRM sync state — it must
+ * never re-upload local/backup task copies (that resurrected deleted tasks).
+ */
+export async function flushPendingWrites() {
+  await waitForPendingWrites(db);
 }
 
 /**
