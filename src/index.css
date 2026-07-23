@@ -1,0 +1,25 @@
+@import url('https://fonts.googleapis.com/css2?family=Raleway:wght@400;500;600;700;800&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
+  --font-display: "Raleway", "Inter", sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, monospace;
+}
+
+/* Base resets & styling */
+body {
+  font-family: var(--font-sans);
+  background-color: #fafafa;
+  color: #171717;
+}
+
+/* Distraction-free focus style */
+.focus-glow {
+  box-shadow: 0 0 40px rgba(16, 185, 129, 0.1);
+}
+
+.focus-bg {
+  background-radial: radial-gradient(circle at center, #1e293b, #0f172a);
+}
+
