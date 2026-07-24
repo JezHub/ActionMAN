@@ -1,4 +1,4 @@
-import type { Task, NorthStar } from "../types";
+import type { Task, NorthStar, AgentReport } from "../types";
 
 // Client data layer for the Action Man server API (/api/data/*), replacing
 // the old Firestore module. Exports keep the same names/signatures so App.tsx
@@ -139,6 +139,7 @@ type AppState = {
   northStar: NorthStar | null;
   emailFilters: EmailFilters | null;
   briefing: BriefingSettings | null;
+  latestReports?: AgentReport[];
 };
 
 type Subscriber<T extends any[]> = { onUpdate: (...args: T) => void; onError: (err: any) => void };
@@ -147,7 +148,8 @@ const subscribers = {
   tasks: new Set<Subscriber<[Task[], boolean]>>(),
   northStar: new Set<Subscriber<[NorthStar]>>(),
   emailFilters: new Set<Subscriber<[EmailFilters, boolean]>>(),
-  briefing: new Set<Subscriber<[BriefingSettings]>>()
+  briefing: new Set<Subscriber<[BriefingSettings]>>(),
+  agentReports: new Set<Subscriber<[AgentReport[]]>>()
 };
 
 let pollTimer: ReturnType<typeof setInterval> | null = null;
@@ -162,7 +164,13 @@ const inflightMutations = new Set<Promise<any>>();
 let lastMutationCompletedAt = 0;
 
 function subscriberCount(): number {
-  return subscribers.tasks.size + subscribers.northStar.size + subscribers.emailFilters.size + subscribers.briefing.size;
+  return (
+    subscribers.tasks.size +
+    subscribers.northStar.size +
+    subscribers.emailFilters.size +
+    subscribers.briefing.size +
+    subscribers.agentReports.size
+  );
 }
 
 function dispatchState(state: AppState) {
@@ -191,6 +199,8 @@ function dispatchState(state: AppState) {
     const briefing = state.briefing;
     subscribers.briefing.forEach((s) => s.onUpdate(briefing));
   }
+  const reports = state.latestReports || [];
+  subscribers.agentReports.forEach((s) => s.onUpdate(reports));
 }
 
 function dispatchError(err: any) {
@@ -198,6 +208,7 @@ function dispatchError(err: any) {
   subscribers.northStar.forEach((s) => s.onError(err));
   subscribers.emailFilters.forEach((s) => s.onError(err));
   subscribers.briefing.forEach((s) => s.onError(err));
+  subscribers.agentReports.forEach((s) => s.onError(err));
 }
 
 async function tick(force = false): Promise<void> {
@@ -276,6 +287,7 @@ export const subscribeTasks = makeSubscribe(subscribers.tasks);
 export const subscribeNorthStar = makeSubscribe(subscribers.northStar);
 export const subscribeEmailFilters = makeSubscribe(subscribers.emailFilters);
 export const subscribeBriefingSettings = makeSubscribe(subscribers.briefing);
+export const subscribeAgentReports = makeSubscribe(subscribers.agentReports);
 
 // --- Mutations (all rethrow on failure so callers can set dbStatus "error") ---
 async function mutate<T>(fn: () => Promise<T>): Promise<T> {
@@ -408,6 +420,15 @@ export async function clearAllDataFromDb(): Promise<void> {
     console.error("Error clearing all data:", error);
     throw error;
   }
+}
+
+/**
+ * Marks a background-agent report as read (it drops off the briefing panel).
+ */
+export async function markAgentReportRead(reportId: string): Promise<void> {
+  await mutate(() =>
+    apiFetch(`/api/data/agent-reports/${encodeURIComponent(reportId)}/read`, { method: "POST" })
+  );
 }
 
 export const logout = async () => {

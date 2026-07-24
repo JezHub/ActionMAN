@@ -43,7 +43,7 @@ import {
   Layers
 } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
-import { Task, NorthStar, DailyCoachFeedback } from "./types";
+import { Task, NorthStar, DailyCoachFeedback, AgentReport } from "./types";
 
 const INITIAL_NORTH_STAR: NorthStar = {
   title: "",
@@ -266,6 +266,9 @@ export default function App() {
   });
 
   const [dbStatus, setDbStatus] = useState<"connecting" | "synced" | "offline" | "error">("connecting");
+
+  // Latest report per background agent (morning brief, weekly review, ...)
+  const [agentReports, setAgentReports] = useState<AgentReport[]>([]);
   const [showResetConfirm, setShowResetConfirm] = useState(false);
 
   const handleResetAllData = async () => {
@@ -336,10 +339,11 @@ export default function App() {
     let unsubscribeNorthStar: (() => void) | null = null;
     let unsubscribeEmailFilters: (() => void) | null = null;
     let unsubscribeBriefing: (() => void) | null = null;
+    let unsubscribeAgentReports: (() => void) | null = null;
 
     async function initDataSync() {
       try {
-        const { seedInitialTasksIfEmpty, subscribeTasks, subscribeNorthStar, subscribeEmailFilters, subscribeBriefingSettings } = await import("./lib/api");
+        const { seedInitialTasksIfEmpty, subscribeTasks, subscribeNorthStar, subscribeEmailFilters, subscribeBriefingSettings, subscribeAgentReports } = await import("./lib/api");
 
         // Seed initial data in background (non-blocking; no-op with empty defaults)
         seedInitialTasksIfEmpty(INITIAL_TASKS, INITIAL_NORTH_STAR).catch((err) => {
@@ -449,6 +453,13 @@ export default function App() {
             }
           );
         }
+        // Latest background-agent reports for the MacGyver briefing panel
+        if (typeof subscribeAgentReports === "function") {
+          unsubscribeAgentReports = subscribeAgentReports(
+            (reports) => setAgentReports(reports || []),
+            (err) => console.error("Agent reports sync error:", err)
+          );
+        }
       } catch (err) {
         console.error("Failed to start data sync, falling back to local state.", err);
         setDbStatus("offline");
@@ -462,6 +473,7 @@ export default function App() {
       if (unsubscribeNorthStar) unsubscribeNorthStar();
       if (unsubscribeEmailFilters) unsubscribeEmailFilters();
       if (unsubscribeBriefing) unsubscribeBriefing();
+      if (unsubscribeAgentReports) unsubscribeAgentReports();
     };
   }, []);
 
@@ -871,6 +883,36 @@ export default function App() {
     } catch (err) {
       console.error("Failed to save email filters to remote DB:", err);
     }
+  };
+
+  // --- MacGyver briefing panel handlers ---
+  const handleDismissReport = async (reportId: string) => {
+    setAgentReports((prev) => prev.map((r) => (r.id === reportId ? { ...r, read: true } : r)));
+    try {
+      const { markAgentReportRead } = await import("./lib/api");
+      await markAgentReportRead(reportId);
+    } catch (err) {
+      console.error("Failed to mark report read:", err);
+    }
+  };
+
+  const handleAddSuggestedTask = async (
+    suggestion: NonNullable<NonNullable<AgentReport["data"]>["suggestedTasks"]>[number]
+  ) => {
+    const newTask: Task = {
+      id: `task-agent-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
+      title: suggestion.title,
+      priority: suggestion.priority || "medium",
+      horizon: suggestion.horizon || "today",
+      category: suggestion.category || "general",
+      dropDeadDate: suggestion.dropDeadDate || undefined,
+      reasoning: suggestion.reasoning,
+      completed: false,
+      createdAt: new Date().toISOString(),
+      tags: ["MacGyver", ...detectTags(suggestion.title)]
+    };
+    await saveTask(newTask);
+    setActiveHorizon(newTask.horizon);
   };
 
   const handleConvertEmailToTask = async (email: any) => {
@@ -3368,6 +3410,62 @@ export default function App() {
               ) : (
                 /* --- GENERAL TIME HORIZON BOARD --- */
                 <div className="flex flex-col gap-8 w-full">
+                  {/* MacGyver Briefing: latest unread reports from background agents */}
+                  {agentReports.filter((r) => !r.read).length > 0 && (
+                    <div className="flex flex-col gap-4 animate-fade-in">
+                      {agentReports.filter((r) => !r.read).map((report) => (
+                        <div key={report.id} className="bg-white rounded-2xl border border-neutral-200 shadow-sm overflow-hidden">
+                          <div className="bg-neutral-950 text-white px-5 py-3 flex items-center justify-between gap-3">
+                            <div className="flex items-center gap-2.5 min-w-0">
+                              <span className="text-base shrink-0">🤖</span>
+                              <div className="min-w-0">
+                                <h3 className="text-sm font-bold font-display truncate">{report.title}</h3>
+                                <p className="text-[10px] font-mono text-neutral-400 uppercase tracking-wider">
+                                  MacGyver &bull; {report.kind.replace(/_/g, " ")}{report.reportDate ? ` · ${report.reportDate}` : ""}
+                                </p>
+                              </div>
+                            </div>
+                            <button
+                              onClick={() => handleDismissReport(report.id)}
+                              className="text-[10px] font-bold uppercase tracking-wider text-neutral-400 hover:text-white border border-neutral-700 hover:border-neutral-500 px-2.5 py-1 rounded-lg transition-all cursor-pointer shrink-0"
+                              title="Mark as read"
+                            >
+                              Dismiss
+                            </button>
+                          </div>
+                          <div className="p-5">
+                            <div className="text-xs text-neutral-700 leading-relaxed whitespace-pre-wrap">
+                              {report.content}
+                            </div>
+                            {report.data?.suggestedTasks && report.data.suggestedTasks.length > 0 && (
+                              <div className="mt-4 pt-4 border-t border-neutral-100 flex flex-col gap-2">
+                                <span className="text-[10px] font-bold font-mono uppercase tracking-wider text-neutral-400">
+                                  Suggested Tasks
+                                </span>
+                                {report.data.suggestedTasks.map((suggestion, idx) => (
+                                  <div key={`${report.id}-sug-${idx}`} className="flex items-center justify-between gap-3 bg-neutral-50 border border-neutral-200 rounded-xl px-3 py-2">
+                                    <div className="min-w-0">
+                                      <p className="text-xs font-semibold text-neutral-900 truncate">{suggestion.title}</p>
+                                      {suggestion.reasoning && (
+                                        <p className="text-[10px] text-neutral-500 truncate">{suggestion.reasoning}</p>
+                                      )}
+                                    </div>
+                                    <button
+                                      onClick={() => handleAddSuggestedTask(suggestion)}
+                                      className="text-[10px] font-bold uppercase tracking-wider bg-neutral-900 hover:bg-neutral-800 text-white px-2.5 py-1.5 rounded-lg transition-all cursor-pointer shrink-0"
+                                    >
+                                      + Add Task
+                                    </button>
+                                  </div>
+                                ))}
+                              </div>
+                            )}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+
                   {/* Side-by-Side: Compact Critical Items and Mind Clutter Brain Dump */}
                   <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 items-stretch animate-fade-in">
                     {/* LEFT: Critical Items */}

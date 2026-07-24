@@ -55,11 +55,23 @@ export async function requireUser(req: AuthedRequest, res: Response, next: NextF
     // explicitly set AND we are not in production.
     const bypass = process.env.DEV_AUTH_BYPASS_EMAIL;
     let email: string | null = null;
-    if (bypass && process.env.NODE_ENV !== "production") {
+    const authHeader = req.headers.authorization || "";
+    const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : "";
+
+    // Background agents (Claude Routines etc.) authenticate with the shared
+    // AGENT_API_TOKEN secret and act as the owner account. The token must be
+    // long enough to be unguessable, and comparison is constant-time.
+    const agentToken = process.env.AGENT_API_TOKEN || "";
+    const isAgentAuth =
+      agentToken.length >= 32 &&
+      token.length === agentToken.length &&
+      crypto.timingSafeEqual(Buffer.from(token), Buffer.from(agentToken));
+
+    if (isAgentAuth) {
+      email = (process.env.AGENT_ACTS_AS_EMAIL || getAllowedEmails()[0]).trim().toLowerCase();
+    } else if (bypass && process.env.NODE_ENV !== "production") {
       email = bypass.trim().toLowerCase();
     } else {
-      const authHeader = req.headers.authorization || "";
-      const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : "";
       if (!token) {
         return res.status(401).json({ error: "Missing authorization token." });
       }

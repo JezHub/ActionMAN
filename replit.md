@@ -108,10 +108,30 @@ already bitten the owner.
 - `server.log` is per-instance/ephemeral on Autoscale; use Replit deployment
   logs for production.
 
+## Background agents (MacGyver layer)
+
+Scheduled Claude Routines act as the app's background intelligence (morning
+brief, weekly review, weekend scout, habit nudge) — prompts and setup live in
+`agents/ROUTINES.md`. Contract:
+
+- Agents authenticate with the `AGENT_API_TOKEN` secret (≥32 chars, compared
+  constant-time in `server/auth.ts`) and act as `AGENT_ACTS_AS_EMAIL` (default:
+  first allowlisted email). Never weaken this to a shorter token or a
+  non-constant-time comparison.
+- Agents write `POST /api/data/agent-reports` ({kind, title, content,
+  reportDate?, data.suggestedTasks?}); the dashboard shows the latest UNREAD
+  report per kind and lets Jeremy add suggested tasks with one tap. Reports
+  are pruned to the newest 30 per kind on insert.
+- Agents PROPOSE, Jeremy disposes: prompts must keep Gmail strictly read-only
+  (no send/archive/label/delete) and never mutate the calendar. Suggested
+  tasks go in `data.suggestedTasks`, not directly into the tasks table,
+  unless a prompt explicitly says otherwise.
+
 ## Environment
 
 - `GEMINI_API_KEY` (Secrets), `DATABASE_URL` (attach Replit PostgreSQL),
-  optional `ALLOWED_EMAILS`, `APP_URL`. `DEV_AUTH_BYPASS_EMAIL` is
+  optional `ALLOWED_EMAILS`, `APP_URL`, `AGENT_API_TOKEN` +
+  `AGENT_ACTS_AS_EMAIL` (background-agent auth, see agents/ROUTINES.md). `DEV_AUTH_BYPASS_EMAIL` is
   development-only and ignored in production — never set it on a deployment.
 - `npm run dev` (workspace), `npm run build` + `npm run start` (deployment).
 

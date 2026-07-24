@@ -1,7 +1,8 @@
 import fs from "fs";
 import path from "path";
 import { Pool } from "pg";
-import type { Task, NorthStar } from "../src/types";
+import crypto from "crypto";
+import type { Task, NorthStar, AgentReport } from "../src/types";
 
 export type EmailFilters = {
   ignoredSenders: string[];
@@ -27,7 +28,19 @@ export interface AppState {
   northStar: NorthStar | null;       // null = never written
   emailFilters: EmailFilters | null; // null = never written (client `exists` flag)
   briefing: BriefingSettings | null;
+  latestReports: AgentReport[];      // newest report per agent kind
 }
+
+export type NewAgentReport = {
+  kind: string;
+  title: string;
+  content: string;
+  reportDate?: string;
+  data?: Record<string, any>;
+};
+
+// Keep this many reports per kind per user; older ones are pruned on insert.
+export const REPORTS_KEPT_PER_KIND = 30;
 
 export interface Storage {
   init(): Promise<void>;
@@ -38,7 +51,34 @@ export interface Storage {
   putSetting(user: string, key: SettingsKey, data: any, ifAbsent?: boolean): Promise<void>;
   mergeSetting(user: string, key: SettingsKey, patch: any): Promise<void>;
   updateEmailFilters(user: string, add: FilterEntries, remove: FilterEntries): Promise<EmailFilters>;
+  insertAgentReport(user: string, report: NewAgentReport): Promise<AgentReport>;
+  listAgentReports(user: string, kind: string | undefined, limit: number): Promise<AgentReport[]>;
+  markAgentReportRead(user: string, id: string): Promise<void>;
   clearAll(user: string): Promise<void>;
+}
+
+function buildAgentReport(report: NewAgentReport): AgentReport {
+  return {
+    id: `report-${Date.now()}-${crypto.randomBytes(4).toString("hex")}`,
+    kind: report.kind,
+    reportDate: report.reportDate || undefined,
+    title: report.title,
+    content: report.content,
+    data: report.data || undefined,
+    read: false,
+    createdAt: new Date().toISOString()
+  };
+}
+
+function latestPerKind(reports: AgentReport[]): AgentReport[] {
+  const byKind = new Map<string, AgentReport>();
+  for (const r of reports) {
+    const existing = byKind.get(r.kind);
+    if (!existing || (r.createdAt || "") > (existing.createdAt || "")) {
+      byKind.set(r.kind, r);
+    }
+  }
+  return Array.from(byKind.values()).sort((a, b) => (b.createdAt || "").localeCompare(a.createdAt || ""));
 }
 
 const EMPTY_FILTERS: EmailFilters = { ignoredSenders: [], ignoredDomains: [], ignoredEmails: [] };
@@ -96,21 +136,32 @@ class PgStorage implements Storage {
         PRIMARY KEY (user_email, key)
       );
     `);
+    await this.pool.query(`
+      CREATE TABLE IF NOT EXISTS agent_reports (
+        user_email TEXT NOT NULL,
+        id         TEXT NOT NULL,
+        data       JSONB NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        PRIMARY KEY (user_email, id)
+      );
+    `);
   }
 
   async getState(user: string): Promise<AppState> {
     // No ORDER BY on purpose: legacy tasks may lack createdAt and the client
     // sorts by createdAt desc itself.
-    const [tasksRes, settingsRes] = await Promise.all([
+    const [tasksRes, settingsRes, reportsRes] = await Promise.all([
       this.pool.query("SELECT data FROM tasks WHERE user_email = $1", [user]),
-      this.pool.query("SELECT key, data FROM settings WHERE user_email = $1", [user])
+      this.pool.query("SELECT key, data FROM settings WHERE user_email = $1", [user]),
+      this.pool.query("SELECT data FROM agent_reports WHERE user_email = $1", [user])
     ]);
     const settings = new Map<string, any>(settingsRes.rows.map((r) => [r.key, r.data]));
     return {
       tasks: tasksRes.rows.map((r) => r.data as Task),
       northStar: settings.get("north_star") ?? null,
       emailFilters: settings.get("email_filters") ?? null,
-      briefing: settings.get("briefing") ?? null
+      briefing: settings.get("briefing") ?? null,
+      latestReports: latestPerKind(reportsRes.rows.map((r) => r.data as AgentReport))
     };
   }
 
@@ -206,6 +257,54 @@ class PgStorage implements Storage {
     }
   }
 
+  async insertAgentReport(user: string, report: NewAgentReport): Promise<AgentReport> {
+    const full = buildAgentReport(report);
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      await client.query(
+        "INSERT INTO agent_reports (user_email, id, data) VALUES ($1, $2, $3)",
+        [user, full.id, full]
+      );
+      // Prune: keep only the newest REPORTS_KEPT_PER_KIND per kind
+      await client.query(
+        `DELETE FROM agent_reports WHERE user_email = $1 AND id IN (
+           SELECT id FROM agent_reports
+           WHERE user_email = $1 AND data->>'kind' = $2
+           ORDER BY created_at DESC OFFSET $3
+         )`,
+        [user, full.kind, REPORTS_KEPT_PER_KIND]
+      );
+      await client.query("COMMIT");
+      return full;
+    } catch (err) {
+      await client.query("ROLLBACK").catch(() => {});
+      throw err;
+    } finally {
+      client.release();
+    }
+  }
+
+  async listAgentReports(user: string, kind: string | undefined, limit: number): Promise<AgentReport[]> {
+    const res = kind
+      ? await this.pool.query(
+          "SELECT data FROM agent_reports WHERE user_email = $1 AND data->>'kind' = $2 ORDER BY created_at DESC LIMIT $3",
+          [user, kind, limit]
+        )
+      : await this.pool.query(
+          "SELECT data FROM agent_reports WHERE user_email = $1 ORDER BY created_at DESC LIMIT $2",
+          [user, limit]
+        );
+    return res.rows.map((r) => r.data as AgentReport);
+  }
+
+  async markAgentReportRead(user: string, id: string): Promise<void> {
+    await this.pool.query(
+      `UPDATE agent_reports SET data = data || '{"read": true}'::jsonb WHERE user_email = $1 AND id = $2`,
+      [user, id]
+    );
+  }
+
   async clearAll(user: string): Promise<void> {
     const client = await this.pool.connect();
     try {
@@ -235,6 +334,7 @@ type FileShape = {
     [email: string]: {
       tasks: { [id: string]: Task };
       settings: { [key: string]: any };
+      agentReports?: { [id: string]: AgentReport };
     };
   };
 };
@@ -291,7 +391,8 @@ class FileStorage implements Storage {
         tasks: Object.values(u.tasks),
         northStar: u.settings.north_star ?? null,
         emailFilters: u.settings.email_filters ?? null,
-        briefing: u.settings.briefing ?? null
+        briefing: u.settings.briefing ?? null,
+        latestReports: latestPerKind(Object.values(u.agentReports || {}))
       };
     });
   }
@@ -349,6 +450,45 @@ class FileStorage implements Storage {
       u.settings.email_filters = next;
       await this.persist();
       return next;
+    });
+  }
+
+  async insertAgentReport(user: string, report: NewAgentReport): Promise<AgentReport> {
+    return this.enqueue(async () => {
+      const u = this.userState(user);
+      if (!u.agentReports) u.agentReports = {};
+      const full = buildAgentReport(report);
+      u.agentReports[full.id] = full;
+      // Prune per kind
+      const sameKind = Object.values(u.agentReports)
+        .filter((r) => r.kind === full.kind)
+        .sort((a, b) => (b.createdAt || "").localeCompare(a.createdAt || ""));
+      for (const stale of sameKind.slice(REPORTS_KEPT_PER_KIND)) {
+        delete u.agentReports[stale.id];
+      }
+      await this.persist();
+      return full;
+    });
+  }
+
+  async listAgentReports(user: string, kind: string | undefined, limit: number): Promise<AgentReport[]> {
+    return this.enqueue(() => {
+      const u = this.userState(user);
+      return Object.values(u.agentReports || {})
+        .filter((r) => !kind || r.kind === kind)
+        .sort((a, b) => (b.createdAt || "").localeCompare(a.createdAt || ""))
+        .slice(0, limit);
+    });
+  }
+
+  async markAgentReportRead(user: string, id: string): Promise<void> {
+    return this.enqueue(async () => {
+      const u = this.userState(user);
+      const report = u.agentReports?.[id];
+      if (report) {
+        report.read = true;
+        await this.persist();
+      }
     });
   }
 

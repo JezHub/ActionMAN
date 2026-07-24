@@ -114,6 +114,46 @@ export function createDataRouter(storage: Storage): Router {
     }
   });
 
+  // --- Agent reports (written by background agents via AGENT_API_TOKEN) ---
+
+  router.post("/agent-reports", async (req: AuthedRequest, res) => {
+    try {
+      const { kind, title, content, reportDate, data } = req.body || {};
+      if (typeof kind !== "string" || !kind.trim() || typeof title !== "string" || !title.trim() || typeof content !== "string" || !content.trim()) {
+        return res.status(400).json({ error: "kind, title and content are required." });
+      }
+      const report = await storage.insertAgentReport(req.userEmail!, {
+        kind: kind.trim(),
+        title: title.trim(),
+        content,
+        reportDate: typeof reportDate === "string" ? reportDate : undefined,
+        data: data && typeof data === "object" ? data : undefined
+      });
+      res.json({ ok: true, id: report.id });
+    } catch (err) {
+      fail(res, err, "Failed to save agent report.");
+    }
+  });
+
+  router.get("/agent-reports", async (req: AuthedRequest, res) => {
+    try {
+      const kind = typeof req.query.kind === "string" && req.query.kind ? req.query.kind : undefined;
+      const limit = Math.min(Math.max(Number(req.query.limit) || 10, 1), 50);
+      res.json({ reports: await storage.listAgentReports(req.userEmail!, kind, limit) });
+    } catch (err) {
+      fail(res, err, "Failed to list agent reports.");
+    }
+  });
+
+  router.post("/agent-reports/:id/read", async (req: AuthedRequest, res) => {
+    try {
+      await storage.markAgentReportRead(req.userEmail!, req.params.id);
+      res.json({ ok: true });
+    } catch (err) {
+      fail(res, err, "Failed to mark report read.");
+    }
+  });
+
   router.post("/clear", async (req: AuthedRequest, res) => {
     try {
       await storage.clearAll(req.userEmail!);
