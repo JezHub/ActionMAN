@@ -108,7 +108,7 @@ already bitten the owner.
 - `server.log` is per-instance/ephemeral on Autoscale; use Replit deployment
   logs for production.
 
-## Background agents (MacGyver layer)
+## Background agents (The Fonz layer)
 
 Scheduled Claude Routines act as the app's background intelligence (morning
 brief, weekly review, weekend scout, habit nudge) — prompts and setup live in

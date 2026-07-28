@@ -453,7 +453,7 @@ export default function App() {
             }
           );
         }
-        // Latest background-agent reports for the MacGyver briefing panel
+        // Latest background-agent reports for The Fonz briefing panel
         if (typeof subscribeAgentReports === "function") {
           unsubscribeAgentReports = subscribeAgentReports(
             (reports) => setAgentReports(reports || []),
@@ -885,7 +885,7 @@ export default function App() {
     }
   };
 
-  // --- MacGyver briefing panel handlers ---
+  // --- The Fonz briefing panel handlers ---
   const handleDismissReport = async (reportId: string) => {
     setAgentReports((prev) => prev.map((r) => (r.id === reportId ? { ...r, read: true } : r)));
     try {
@@ -909,7 +909,7 @@ export default function App() {
       reasoning: suggestion.reasoning,
       completed: false,
       createdAt: new Date().toISOString(),
-      tags: ["MacGyver", ...detectTags(suggestion.title)]
+      tags: ["The Fonz", ...detectTags(suggestion.title)]
     };
     await saveTask(newTask);
     setActiveHorizon(newTask.horizon);
@@ -3410,7 +3410,7 @@ export default function App() {
               ) : (
                 /* --- GENERAL TIME HORIZON BOARD --- */
                 <div className="flex flex-col gap-8 w-full">
-                  {/* MacGyver Briefing: latest unread reports from background agents */}
+                  {/* The Fonz Briefing: latest unread reports from background agents */}
                   {agentReports.filter((r) => !r.read).length > 0 && (
                     <div className="flex flex-col gap-4 animate-fade-in">
                       {agentReports.filter((r) => !r.read).map((report) => (
@@ -3421,7 +3421,7 @@ export default function App() {
                               <div className="min-w-0">
                                 <h3 className="text-sm font-bold font-display truncate">{report.title}</h3>
                                 <p className="text-[10px] font-mono text-neutral-400 uppercase tracking-wider">
-                                  MacGyver &bull; {report.kind.replace(/_/g, " ")}{report.reportDate ? ` · ${report.reportDate}` : ""}
+                                  The Fonz &bull; {report.kind.replace(/_/g, " ")}{report.reportDate ? ` · ${report.reportDate}` : ""}
                                 </p>
                               </div>
                             </div>
